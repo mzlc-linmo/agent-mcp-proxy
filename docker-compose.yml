@@ -1,8 +1,9 @@
-name: linmo-mcp-proxy
+name: agent-mcp-proxy
 services:
-  linmo-mcp-proxy:
+  agent-mcp-proxy:
     build: .
-    image: linmo/mcp-proxy:local
+    image: linmo/agent-mcp-proxy:latest
+    container_name: agent-mcp-proxy
     restart: unless-stopped
     user: "${BRIDGE_UID:-65534}:${BRIDGE_GID:-65534}"
     read_only: true
@@ -26,4 +27,4 @@ services:
 networks:
   linmo:
     external: true
-    name: ${LINMO_DOCKER_NETWORK:-linmo-backend}
+    name: ${AGENT_DOCKER_NETWORK:-agent-backend}
