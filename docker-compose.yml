@@ -1,0 +1,29 @@
+name: linmo-mcp-proxy
+services:
+  linmo-mcp-proxy:
+    build: .
+    image: linmo/mcp-proxy:local
+    restart: unless-stopped
+    user: "${BRIDGE_UID:-65534}:${BRIDGE_GID:-65534}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:size=16m]
+    environment:
+      ADMIN_ORIGIN: "http://${BRIDGE_ADMIN_BIND_IP:?Set LAN bind address}:${BRIDGE_ADMIN_PORT:-18082}"
+      ADMIN_ALLOWED_UPSTREAM_ORIGIN: http://higress:8080
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+    ports:
+      - "${BRIDGE_ADMIN_BIND_IP:?Set LAN bind address}:${BRIDGE_ADMIN_PORT:-18082}:8082"
+    volumes:
+      - ./config.example.json:/app/config.json:ro
+      - ./secrets:/run/secrets:ro
+      - ./runtime:/var/lib/linmo-proxy:rw
+    networks: [linmo]
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: '2'}
+networks:
+  linmo:
+    external: true
+    name: ${LINMO_DOCKER_NETWORK:-linmo-backend}

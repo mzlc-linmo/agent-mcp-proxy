@@ -1,0 +1,4 @@
+mcp==1.30.0
+websockets>=14,<16
+fastapi>=0.115,<0.120
+uvicorn>=0.30,<1

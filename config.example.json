@@ -1,0 +1,9 @@
+{
+  "endpoint_file": "/run/secrets/xiaozhi_endpoint",
+  "upstreams": {
+    "ops-readonly": {"url": "http://higress:8080/mcp/ops-readonly", "key_file": "/run/secrets/readonly_key"},
+    "ops-ai": {"url": "http://higress:8080/mcp/ops-ai", "key_file": "/run/secrets/ai_key"},
+    "ops-actions": {"url": "http://higress:8080/mcp/ops-actions", "key_file": "/run/secrets/operations_key"},
+    "ops-collection": {"url": "http://higress:8080/mcp/ops-collection", "key_file": "/run/secrets/operations_key"}
+  }
+}
