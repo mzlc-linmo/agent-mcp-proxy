@@ -35,6 +35,57 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             await page.wait_for_timeout(100)
             self.assertEqual(saved[0]['endpoint'],'')
 
+    async def test_bulk_tool_selection_is_service_scoped_and_saved(self):
+        async with async_playwright() as p:
+            browser=await p.chromium.launch(headless=True);self.addAsyncCleanup(browser.close)
+            page=await browser.new_page();saved=[];errors=[]
+            def service(sid,names):
+                return {'id':sid,'name':sid,'url':'https://example.com/mcp','transport':'streamable-http','auth':{'mode':'none'},'private_network':False,'discovery':[{'name':name,'inputSchema':{},'schema_hash':'current'} for name in names]}
+            cfg={'version':1,'services':{'github':service('github',['read','write','stale']),'other':service('other',['read']),'empty':service('empty',[])},'devices':[{'id':'one','name':'Device one','enabled':True,'endpoint_configured':True,'bindings':{'github':[{'name':'read','schema_hash':'current','alias':'read'},{'name':'stale','schema_hash':'old','alias':'stale'}],'other':[{'name':'read','schema_hash':'current','alias':'other_read'}]}}]}
+            async def handler(route):
+                url=route.request.url
+                if '/api/session' in url:return await route.fulfill(json={'csrf':'synthetic','username':'operator'})
+                if '/api/config' in url:return await route.fulfill(json=cfg)
+                if '/api/status' in url:return await route.fulfill(json={'endpoints':{}})
+                if '/api/devices/one' in url:
+                    self.assertEqual(route.request.method,'PUT')
+                    self.assertTrue(url.endswith('/api/devices/one'))
+                    saved.append(route.request.post_data_json);return await route.fulfill(json={'saved_version':2})
+                filename='index.html' if url.split('#')[0]=='http://test.local/' else url.split('/static/')[-1]
+                await route.fulfill(path=str(Path(__file__).parent/'static'/filename))
+            await page.route('http://test.local/**',handler)
+            page.on('dialog',lambda d:d.accept())
+            page.on('pageerror',lambda error:errors.append(str(error)))
+            await page.goto('http://test.local/#/devices/one')
+            group=page.get_by_role('group',name='github',exact=True)
+            await group.wait_for()
+            self.assertEqual(await group.get_by_role('button',name='全选',exact=True).count(),1)
+            self.assertEqual(await page.get_by_role('group',name='empty',exact=True).get_by_role('button',name='全选',exact=True).count(),0)
+            other=page.get_by_role('group',name='other',exact=True).get_by_role('checkbox')
+            self.assertEqual(await group.get_by_role('checkbox').evaluate_all('(items)=>items.map(e=>e.checked)'),[True,False,False])
+            await group.get_by_role('button',name='反选',exact=True).click()
+            self.assertEqual(await group.get_by_role('checkbox').evaluate_all('(items)=>items.map(e=>e.checked)'),[False,True,True])
+            self.assertTrue(await other.is_checked());self.assertEqual(saved,[])
+            await page.get_by_role('button',name='保存',exact=True).click()
+            await page.wait_for_function("document.getElementById('message').textContent.includes('已保存')")
+            self.assertEqual(saved[-1]['bindings'],{'github':['write','stale']})
+            await group.get_by_role('button',name='全选',exact=True).click()
+            self.assertEqual(await group.get_by_role('checkbox').evaluate_all('(items)=>items.map(e=>e.checked)'),[True,True,True])
+            self.assertTrue(await other.is_checked());self.assertEqual(len(saved),1)
+            await page.get_by_role('button',name='保存',exact=True).click()
+            await page.wait_for_function("document.getElementById('message').textContent.includes('已保存')")
+            self.assertEqual(saved[-1]['bindings'],{'github':['read','write','stale']})
+            await group.get_by_role('button',name='全选',exact=True).click()
+            await group.get_by_role('button',name='反选',exact=True).click()
+            self.assertEqual(await group.get_by_role('checkbox').evaluate_all('(items)=>items.map(e=>e.checked)'),[False,False,False])
+            await page.get_by_role('button',name='保存',exact=True).click()
+            await page.wait_for_function("document.getElementById('message').textContent.includes('已保存')")
+            self.assertEqual(saved[-1]['bindings'],{'github':[]})
+            self.assertEqual(len(saved),3);self.assertEqual(errors,[])
+            await page.locator('#language').select_option('en')
+            await page.get_by_role('group',name='github',exact=True).get_by_role('button',name='Select all',exact=True).wait_for()
+            self.assertEqual(await page.get_by_role('group',name='github',exact=True).get_by_role('button',name='Invert selection',exact=True).count(),1)
+
     async def test_device_table_help_and_row_delete(self):
         async with async_playwright() as p:
             browser=await p.chromium.launch(headless=True);self.addAsyncCleanup(browser.close)
