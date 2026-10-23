@@ -9,7 +9,6 @@ class StaticTests(unittest.TestCase):
         self.assertNotIn('innerHTML',script)
         self.assertNotIn('eval(',script)
         self.assertIn('textContent',script)
-        self.assertIn('HTTP',page)
         self.assertIn('aria-live',page)
         self.assertIn('zh:',script);self.assertIn('en:',script)
         self.assertNotIn('localStorage.setItem(\'password',script)

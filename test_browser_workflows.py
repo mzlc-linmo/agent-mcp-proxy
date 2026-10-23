@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import unittest
 try:
-    from playwright.async_api import async_playwright
+    from playwright.async_api import async_playwright,expect
 except ImportError:
     async_playwright=None
 
@@ -116,6 +116,124 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             await page.wait_for_function("document.querySelectorAll('tbody tr').length === 0")
             self.assertEqual(len(dialogs),2);self.assertTrue(deleted[0]['confirm_bound'])
 
+    async def test_lists_filter_before_paging_and_keep_independent_state(self):
+        async with async_playwright() as p:
+            browser=await p.chromium.launch(headless=True);self.addAsyncCleanup(browser.close)
+            page=await browser.new_page();errors=[];writes=[]
+            discovery_started=asyncio.Event();finish_discovery=asyncio.Event()
+            cfg={'version':1,'devices':[{'id':f'device-{i}','name':f'{"Alpha " if i in (1,6) else ""}Device {i}','enabled':False,'endpoint_configured':True,'bindings':{}} for i in range(1,7)],'services':{f'service-{i}':{'id':f'service-{i}','name':f'{"Alpha " if i in (1,11) else ""}Service {i}','url':f'https://example.com/visible-{i}','transport':'streamable-http','auth':{'mode':'bearer','configured':True},'private_network':False,'discovery':[]} for i in range(1,12)}}
+            async def handler(route):
+                url=route.request.url
+                if '/api/' in url:
+                    path=url.split('/api/')[1]
+                    if path=='session':return await route.fulfill(json={'csrf':'synthetic','username':'operator'})
+                    if path=='config':return await route.fulfill(json=cfg)
+                    if path=='status':return await route.fulfill(json={'endpoints':{}})
+                    writes.append((route.request.method,path))
+                    if path=='services/service-6/discover':
+                        discovery_started.set();await finish_discovery.wait()
+                        return await route.fulfill(json={'saved_version':cfg['version'],'discovered':0})
+                    if route.request.method=='DELETE':
+                        kind,item_id=path.split('/')
+                        if kind=='devices':cfg['devices']=[d for d in cfg['devices'] if d['id']!=item_id]
+                        else:del cfg['services'][item_id]
+                        cfg['version']+=1
+                        return await route.fulfill(json={'saved_version':cfg['version']})
+                    return await route.fulfill(status=404,json={})
+                filename='index.html' if url.split('#')[0]=='http://test.local/' else url.split('/static/')[-1]
+                await route.fulfill(path=str(Path(__file__).parent/'static'/filename))
+            await page.route('http://test.local/**',handler)
+            page.on('dialog',lambda d:d.accept())
+            page.on('pageerror',lambda e:errors.append(str(e)))
+            await page.goto('http://test.local/#/devices')
+            for kind,menu,count,last_page,query,identity,visible_url,selector in [
+                ('devices','设备管理',6,2,'device','DEVICE-6',None,'.device-table tbody tr'),
+                ('services','MCP 服务目录',11,3,'service','SERVICE-11','VISIBLE-11','.service-card'),
+            ]:
+                with self.subTest(kind=kind):
+                    await page.get_by_role('link',name=menu,exact=True).click()
+                    items=page.locator(selector)
+                    await items.first.wait_for()
+                    for label in await page.locator('.list-controls label').all():
+                        aligned=await label.evaluate('(e)=>{const range=document.createRange();range.selectNode(e.firstChild);const text=range.getBoundingClientRect();const control=e.lastElementChild.getBoundingClientRect();return text.right<=control.left&&Math.abs((text.top+text.bottom-control.top-control.bottom)/2)<1;}')
+                        self.assertTrue(aligned,'Query/page-size label and control must share a row')
+                    self.assertEqual(await items.count(),5)
+                    self.assertTrue(await page.get_by_role('button',name='上一页',exact=True).is_disabled())
+                    for _ in range(last_page-1):await page.get_by_role('button',name='下一页',exact=True).click()
+                    self.assertEqual(await items.count(),1)
+                    self.assertTrue(await page.get_by_role('button',name='下一页',exact=True).is_disabled())
+                    search=page.get_by_role('searchbox')
+                    await search.fill('  aLpHa  ')
+                    self.assertEqual(await items.count(),2)
+                    self.assertTrue(await page.get_by_role('button',name='上一页',exact=True).is_disabled())
+                    self.assertTrue(await page.get_by_role('button',name='下一页',exact=True).is_disabled())
+                    await search.fill(identity)
+                    self.assertEqual(await items.count(),1)
+                    if visible_url:
+                        await search.fill(visible_url)
+                        self.assertEqual(await items.count(),1)
+                        await search.fill('bearer')
+                        self.assertEqual(await items.count(),0)  # Authentication metadata is not a searchable field.
+                    await search.fill('no-such-record')
+                    self.assertEqual(await items.count(),0)
+                    self.assertTrue(await page.get_by_text('没有匹配结果',exact=True).is_visible())
+                    self.assertTrue(await page.get_by_role('button',name='下一页',exact=True).is_disabled())
+                    await search.fill(query)
+                    self.assertEqual(await items.count(),5)
+                    await page.get_by_role('combobox',name='每页条数',exact=True).select_option('10')
+                    self.assertEqual(await items.count(),min(count,10))
+                    if kind=='services':
+                        await page.get_by_role('button',name='下一页',exact=True).click()
+                        self.assertEqual(await items.count(),1)
+                    await page.get_by_role('combobox',name='每页条数',exact=True).select_option('20')
+                    self.assertEqual(await items.count(),count)
+                    self.assertTrue(await page.get_by_role('button',name='上一页',exact=True).is_disabled())
+                    await page.get_by_role('combobox',name='每页条数',exact=True).select_option('5')
+                    await page.get_by_role('button',name='下一页',exact=True).click()
+                    name_link=items.first.locator('a').first
+                    await name_link.click()
+                    await page.get_by_role('link',name='返回列表',exact=True).click()
+                    await expect(search).to_have_value(query)
+                    await expect(page.get_by_role('button',name='上一页',exact=True)).to_be_enabled()
+                    self.assertEqual(await items.count(),1 if kind=='devices' else 5)
+                    await page.get_by_role('button',name='刷新',exact=True).click()
+                    await expect(search).to_have_value(query)
+                    await expect(page.get_by_role('button',name='上一页',exact=True)).to_be_enabled()
+                    if kind=='services':await page.get_by_role('button',name='下一页',exact=True).click()
+                    await items.last.get_by_role('button',name='删除',exact=True).click()
+                    await page.wait_for_function('(s)=>document.querySelectorAll(s).length===5',arg=selector)
+                    await expect(search).to_have_value(query)
+                    self.assertEqual(await page.locator('.pagination-summary').inner_text(),f'共 {count-1} 条 · 第 {last_page-1} / {last_page-1} 页')
+            await page.get_by_role('link',name='设备管理',exact=True).click()
+            await expect(page.get_by_role('searchbox')).to_have_value('device')
+            self.assertTrue(await page.get_by_role('button',name='上一页',exact=True).is_disabled())
+            await page.get_by_role('combobox',name='每页条数',exact=True).select_option('20')
+            await page.get_by_role('link',name='MCP 服务目录',exact=True).click()
+            await expect(page.get_by_role('searchbox')).to_have_value('service')
+            await expect(page.get_by_role('button',name='上一页',exact=True)).to_be_enabled()
+            await page.locator('#language').select_option('en')
+            await expect(page.get_by_role('combobox',name='Items per page',exact=True)).to_have_value('5')
+            self.assertEqual(await page.locator('.pagination-summary').inner_text(),'Total 10 · Page 2 / 2')
+            self.assertTrue(await page.get_by_role('button',name='Next',exact=True).is_disabled())
+            await page.get_by_role('link',name='Devices',exact=True).click()
+            await expect(page.get_by_role('combobox',name='Items per page',exact=True)).to_have_value('20')
+            await expect(page.get_by_role('searchbox')).to_have_value('device')
+            await page.get_by_role('link',name='MCP Services',exact=True).click()
+            await expect(page.get_by_role('combobox',name='Items per page',exact=True)).to_have_value('5')
+            await page.set_viewport_size({'width':390,'height':844})
+            self.assertTrue(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
+            await page.locator('.service-card').first.get_by_role('button',name='Discover tools (no execution)',exact=True).click()
+            await discovery_started.wait()
+            try:
+                await page.get_by_role('searchbox').fill('service')
+                await expect(page.locator('.service-card').first.get_by_role('button',name='Discover tools (no execution)',exact=True)).to_be_disabled()
+                await expect(page.get_by_role('button',name='Next',exact=True)).to_be_disabled()
+            finally:
+                finish_discovery.set()
+                await expect(page.get_by_role('button',name='Next',exact=True)).to_be_enabled()
+            self.assertEqual(writes,[('DELETE','devices/device-6'),('DELETE','services/service-11'),('POST','services/service-6/discover')])
+            self.assertEqual(errors,[])
+
     async def test_device_and_service_add_links_share_toolbar_style(self):
         async with async_playwright() as p:
             browser=await p.chromium.launch(headless=True);self.addAsyncCleanup(browser.close)
@@ -186,6 +304,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('Agent MCP Proxy',await page.locator('.sidebar-brand').inner_text())
             self.assertEqual(await page.title(),'Agent MCP Proxy')
             self.assertNotIn('Linmo',await page.locator('body').inner_text())
+            await expect(page.get_by_text('HTTP 不加密：密码、会话及新密钥可能被监听，仅可信局域网使用。',exact=True)).to_have_count(0)
             await page.get_by_role('link',name='MCP 服务目录',exact=True).click()
             await page.wait_for_function("document.getElementById('breadcrumb').textContent === 'MCP 服务目录'")
             self.assertEqual(await page.locator('#breadcrumb').inner_text(),'MCP 服务目录')
@@ -193,8 +312,35 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             await page.locator('#language').select_option('en')
             await page.wait_for_timeout(50)
             self.assertEqual(await page.locator('#breadcrumb').inner_text(),'MCP Services')
+            warning=page.get_by_text('HTTP is unencrypted: passwords, sessions and new credentials may be intercepted. Trusted LAN only.',exact=True)
+            await expect(warning).to_have_count(0)
+            await page.get_by_role('link',name='System notes',exact=True).click()
+            await expect(warning).to_be_visible()
             await page.set_viewport_size({'width':390,'height':844})
             self.assertTrue(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
+
+    async def test_discovery_success_uses_accessible_icon(self):
+        async with async_playwright() as p:
+            browser=await p.chromium.launch(headless=True);self.addAsyncCleanup(browser.close)
+            page=await browser.new_page()
+            service={'id':'found','name':'Found service','transport':'streamable-http','auth':{'mode':'none'},'url':'https://example.com/mcp','private_network':False,'discovery':[{'name':'lookup','inputSchema':{},'schema_hash':'synthetic'}]}
+            cfg={'version':1,'devices':[],'services':{'found':service,'pending':dict(service,id='pending',name='Pending service',discovery=[])}}
+            async def handler(route):
+                url=route.request.url
+                if '/api/session' in url:return await route.fulfill(json={'csrf':'synthetic','username':'operator'})
+                if '/api/config' in url:return await route.fulfill(json=cfg)
+                filename='index.html' if url.split('#')[0]=='http://test.local/' else url.split('/static/')[-1]
+                await route.fulfill(path=str(Path(__file__).parent/'static'/filename))
+            await page.route('http://test.local/**',handler)
+            await page.goto('http://test.local/#/services')
+            await page.locator('.service-card').first.wait_for()
+            for language,label,unchecked in [('zh','发现成功','未检测'),('en','Discovery succeeded','Not checked')]:
+                await page.locator('#language').select_option(language)
+                icon=page.get_by_role('img',name=label,exact=True)
+                await expect(icon).to_have_text('✓')
+                await expect(icon).to_have_attribute('title',label)
+                await expect(page.locator('.service-card').get_by_text(label,exact=True)).to_have_count(0)
+                await expect(page.locator('.service-card').get_by_text(unchecked,exact=True)).to_be_visible()
 
     async def test_binding_cards_distinguish_ids_and_ignore_empty_grants(self):
         async with async_playwright() as p:
