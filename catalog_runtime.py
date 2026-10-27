@@ -10,9 +10,10 @@ from mcp.shared.message import SessionMessage
 from catalog import schema_hash
 from admin_config import ConfigError
 from policy import compact
-from service_transport import service_session
+from service_transport import service_session,session_timeout
 from proxy import connect,secure_logging
 import feishu_readonly
+import local_stdio
 from feishu_stdio import error_code
 
 FEISHU_HINT='[飞书应用身份·只读] '
@@ -76,15 +77,15 @@ async def bridge_catalog(config,report):
     async with AsyncExitStack() as stack:
         for sid,service in config['services'].items():
             grants=config['bindings'].get(sid,[])
-            if feishu_readonly.is_feishu(service):
-                # Grants awaiting review or outside the fixed list never start a Feishu process.
+            if feishu_readonly.is_feishu(service) or local_stdio.is_local(service):
+                # Grants awaiting review (or outside the fixed Feishu list) never start a process.
                 grants=[g for g in grants if feishu_readonly.tool_allowed(service,g['name']) and g['schema_hash']!='review-required']
             if not grants:
                 report('upstream',{'domain':sid,'state':'disabled'});continue
             # Each service gets its own child stack so failed initialization closes partial resources.
             child=await stack.enter_async_context(AsyncExitStack())
             try:
-                async with asyncio.timeout(15):
+                async with asyncio.timeout(session_timeout(service,15)):
                     session=await child.enter_async_context(service_session(service))
                     tools=[];cursor=None
                     for _ in range(20):

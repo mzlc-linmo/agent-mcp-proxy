@@ -55,11 +55,20 @@ async def main():
             # Feishu read-only service: synthetic App ID only; the secret is never part of the public projection.
             feishu_tools = [{'name': n, 'description': d, 'inputSchema': {'type': 'object'}, 'schema_hash': 'demo', 'annotations': {'readOnlyHint': True}} for n, d in [('im_v1_chat_list', '演示：列出应用所在的群'), ('docx_v1_document_rawContent', '演示：读取文档纯文本')]]
             cfg['services']['feishu-demo'] = {'id': 'feishu-demo', 'name': '飞书只读（演示）', 'provider': 'feishu-readonly', 'transport': 'stdio', 'app_id': 'cli_demo_app', 'app_secret_configured': True, 'discovery': feishu_tools}
-            await page.goto('http://manual.local/#/services/feishu-demo')
+            # Reload first so the page knows the new service; a hash change against the old list redirects to the catalog.
             await page.reload()
+            await page.goto('http://manual.local/#/services/feishu-demo')
             await expect(page.get_by_role('textbox', name='App ID', exact=True)).to_have_value('cli_demo_app')
             await page.locator('#view section').screenshot(path=str(OUT / '06-飞书只读示例.png'))
             print('Captured synthetic UI:', '06-飞书只读示例.png')
+            # Local program: synthetic command and env name only; env values are never part of the public projection.
+            time_tools = [{'name': n, 'description': d, 'inputSchema': {'type': 'object'}, 'schema_hash': 'demo'} for n, d in [('get_current_time', '演示：查询某时区的当前时间'), ('convert_time', '演示：换算两个时区的时间')]]
+            cfg['services']['time-demo'] = {'id': 'time-demo', 'name': '时间工具（演示）', 'transport': 'stdio', 'command': 'uvx', 'args': ['mcp-server-time==2026.10.19', '--local-timezone', 'Asia/Shanghai'], 'env_keys': ['DEMO_API_KEY'], 'discovery': time_tools, 'runtime': {'state': 'ready', 'at': '2026-10-27T03:00:00Z'}}
+            await page.reload()
+            await page.goto('http://manual.local/#/services/time-demo')
+            await expect(page.get_by_role('textbox', name='命令', exact=True)).to_have_value('uvx')
+            await page.locator('#view section').screenshot(path=str(OUT / '07-本地插件示例.png'))
+            print('Captured synthetic UI:', '07-本地插件示例.png')
         finally:
             await browser.close()
 

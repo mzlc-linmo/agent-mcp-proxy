@@ -48,7 +48,14 @@ def create_app(store,manager,auth,allowed_origin):
         return response
 
     @app.exception_handler(ConfigError)
-    async def config_error(request,error):return JSONResponse({'error':str(error),**({'error_code':error.code} if error.code else {})},status_code=error.status)
+    async def config_error(request,error):return JSONResponse({'error':str(error),**({'error_code':error.code} if error.code else {}),**({'detail':error.detail} if getattr(error,'detail',None) else {})},status_code=error.status)
+
+    def with_runtime(value):
+        # Local programs carry their install/start state (in memory, reset on restart) so the page can show progress and failures.
+        import local_stdio,stdio_runtime
+        for sid,s in value['services'].items():
+            if local_stdio.is_local(s):s['runtime']=stdio_runtime.state(sid)
+        return value
 
     async def payload(request):
         try:
@@ -73,7 +80,7 @@ def create_app(store,manager,auth,allowed_origin):
     async def session(request:Request):return {k:request.state.session[k] for k in ('username','csrf')}
 
     @app.get('/api/config')
-    async def config():return store.public()
+    async def config():return with_runtime(store.public())
 
     @app.put('/api/config')
     async def save(request:Request):
@@ -130,13 +137,15 @@ def create_app(store,manager,auth,allowed_origin):
 
     @app.get('/api/services')
     async def services():
-        value=store.public();return {'version':value['version'],'services':value['services']}
+        value=with_runtime(store.public());return {'version':value['version'],'services':value['services']}
 
     @app.post('/api/services/import')
     async def import_services(request:Request):
         body=await payload(request)
-        if set(body)-{'version','document','descriptor_url','preview','service_auth'} or ('document' in body)==('descriptor_url' in body):raise ConfigError('Invalid import request')
-        from service_import import parse_import,fetch_descriptor
+        if set(body)-{'version','document','descriptor_url','preview','service_auth','inputs'} or ('document' in body)==('descriptor_url' in body):raise ConfigError('Invalid import request')
+        from service_import import parse_import,fetch_descriptor,resolve,preview as stdio_preview
+        values=body.get('inputs',{})
+        if not isinstance(values,dict) or len(values)>200 or any(not isinstance(k,str) or not isinstance(v,str) or len(v)>8192 for k,v in values.items()):raise ConfigError('Invalid import inputs')
         override=body.get('service_auth')
         if override is not None:
             from service_transport import auth_headers
@@ -146,14 +155,20 @@ def create_app(store,manager,auth,allowed_origin):
         try:entries=await fetch_descriptor(body['descriptor_url'],auth_override=override) if 'descriptor_url' in body else parse_import(body['document'])
         except ConfigError:raise
         except Exception:raise ConfigError('Descriptor unavailable or rejected',502) from None
+        # Inputs are keyed "<entry index>:<input key>" so several local programs can be imported together.
         if body.get('preview',False):
             from urllib.parse import urlsplit
-            return {'entries':[{'name':e['name'],'transport':e['transport'],'auth_mode':e['auth']['mode'],'private_network':e['private_network'],'origin':urlsplit(e['url']).scheme+'://'+urlsplit(e['url']).netloc} for e in entries]}
-        return store.import_services(entries,body.get('version'))
+            return {'entries':[stdio_preview(e,values,'%d:'%i) if e['transport']=='stdio' else {'name':e['name'],'transport':e['transport'],'auth_mode':e['auth']['mode'],'private_network':e['private_network'],'origin':urlsplit(e['url']).scheme+'://'+urlsplit(e['url']).netloc} for i,e in enumerate(entries)]}
+        rows=[];missing=[]
+        for i,e in enumerate(entries):
+            if e['transport']!='stdio':rows.append(e);continue
+            entry,lack=resolve(e,values,'%d:'%i);rows.append(entry);missing+=['%d:%s'%(i,k) for k in lack]
+        if missing:raise ConfigError('Required values missing',422,'import_inputs_required',', '.join(missing))
+        return store.import_services(rows,body.get('version'))
 
     @app.get('/api/services/{sid}')
     async def service(sid:str):
-        value=store.public()
+        value=with_runtime(store.public())
         if sid not in value['services']:raise ConfigError('Service not found',404)
         return {'version':value['version'],'service':value['services'][sid]}
 
@@ -163,26 +178,48 @@ def create_app(store,manager,auth,allowed_origin):
 
     @app.put('/api/services/{sid}')
     async def update_service(sid:str,request:Request):
-        body=await payload(request);version=body.pop('version',None);return store.update_service(sid,body,version)
+        body=await payload(request);version=body.pop('version',None)
+        import local_stdio,stdio_runtime
+        launch=lambda:(lambda s:[s.get(k) for k in ('command','args','env')] if local_stdio.is_local(s) else None)(store.load()['services'].get(sid))
+        before=launch();result=store.update_service(sid,body,version)
+        # A new command line makes the previous install/start result meaningless.
+        if before is not None and before!=launch():stdio_runtime.forget(sid)
+        return result
 
     @app.delete('/api/services/{sid}')
     async def delete_service(sid:str,request:Request):
         body=await payload(request)
         if set(body)!={'version'}:raise ConfigError()
-        return {'saved_version':store.delete_service(sid,body['version'])}
+        import local_stdio,stdio_runtime
+        local=local_stdio.is_local(store.load()['services'].get(sid))
+        saved=store.delete_service(sid,body['version'])
+        if local:
+            # Deleting a local program also removes its package cache and home directory.
+            stdio_runtime.clear_cache(sid,everything=True);stdio_runtime.forget(sid)
+        return {'saved_version':saved}
 
-    @app.post('/api/services/{sid}/discover')
-    async def discover_service(sid:str,request:Request):
+    async def discover(sid,request,reinstall=False):
         config=await current(request)
         if sid not in config['services']:raise ConfigError('Service not found',404)
         from service_transport import discover_service
-        from feishu_stdio import error_code,MESSAGES
-        try:tools=await discover_service(config['services'][sid])
+        import local_stdio,stdio_runtime
+        service=config['services'][sid]
+        if reinstall and not local_stdio.is_local(service):raise ConfigError('Only local programs can be reinstalled',422)
+        try:tools=await discover_service(service,reinstall=reinstall)
         except Exception as error:
-            code=error_code(error)
-            if code:raise ConfigError(MESSAGES[code],429 if code in ('feishu_discovery_busy','feishu_capacity') else 503,code) from None
+            found=stdio_runtime.find_error(error)
+            if found:raise ConfigError(str(found),429 if found.code in stdio_runtime.BUSY_CODES else 503,found.code,found.detail or None) from None
+            if local_stdio.is_local(service) and isinstance(error,TimeoutError):raise ConfigError(stdio_runtime.CODES['stdio_timeout'],503,'stdio_timeout') from None
             raise ConfigError('Service discovery unavailable or rejected',502) from None
         return {'saved_version':store.record_discovery(sid,tools,config['version']),'discovered':len(tools)}
+
+    @app.post('/api/services/{sid}/discover')
+    async def discover_service(sid:str,request:Request):return await discover(sid,request)
+
+    @app.post('/api/services/{sid}/reinstall')
+    async def reinstall_service(sid:str,request:Request):
+        # Clears this program's npm/uv caches, then discovers again (which downloads afresh).
+        return await discover(sid,request,reinstall=True)
 
     @app.get('/api/devices')
     async def devices():

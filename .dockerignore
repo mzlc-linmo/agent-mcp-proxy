@@ -1,5 +1,6 @@
 secrets/
 runtime/
+cache/
 .env
 __pycache__/
 test_*.py

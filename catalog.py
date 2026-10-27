@@ -9,6 +9,7 @@ from admin_config import ConfigError,ConfigStore
 from policy import ALLOWED
 from service_transport import validate_target,auth_headers
 import feishu_readonly
+import local_stdio
 
 
 def schema_hash(schema):
@@ -57,6 +58,8 @@ class CatalogStore:
             if feishu_readonly.is_feishu(s):
                 services[sid]={k:copy.deepcopy(s[k]) for k in ('id','name','provider','transport','app_id','discovery')}|{'app_secret_configured':bool(s['app_secret'])}
                 continue
+            if local_stdio.is_local(s):
+                services[sid]=copy.deepcopy(local_stdio.public(s));continue
             from urllib.parse import urlsplit
             u=urlsplit(s['url']);safe_url=s['url'] if not u.query else u.scheme+'://'+u.netloc+'/…'
             services[sid]={k:copy.deepcopy(s[k]) for k in ('id','name','transport','private_network','discovery')}
@@ -69,7 +72,9 @@ class CatalogStore:
             if type(version) is not int or version!=v['version']:raise ConfigError('Configuration version conflict',409)
             fn(v);v['version']+=1;self._validate(v);self.disk._write(v);return v['version']
     def add_service(self,entry,version):
-        if isinstance(entry,dict) and ('provider' in entry or entry.get('transport')=='stdio'):return self._add_feishu(entry,version)
+        if not isinstance(entry,dict):raise ConfigError()
+        if 'provider' in entry:return self._add_feishu(entry,version)
+        if entry.get('transport')==local_stdio.TRANSPORT:return self._add_local(entry,version)
         if set(entry)!={'name','url','transport','auth','private_network'}:raise ConfigError()
         sid=uuid.uuid4().hex[:12]
         saved=self._change(version,lambda v:v['services'].update({sid:copy.deepcopy(entry)|{'id':sid,'discovery':[],'legacy_profile':None}}))
@@ -79,6 +84,20 @@ class CatalogStore:
         self._feishu_credentials(entry['app_id'],entry['app_secret'])
         sid=uuid.uuid4().hex[:12]
         saved=self._change(version,lambda v:v['services'].update({sid:copy.deepcopy(entry)|{'id':sid,'discovery':[],'legacy_profile':None}}))
+        return {'id':sid,'saved_version':saved}
+
+    @staticmethod
+    def _local_entry(entry):
+        if not isinstance(entry,dict) or set(entry)!=local_stdio.INPUT_KEYS or entry['transport']!=local_stdio.TRANSPORT:raise ConfigError()
+        if not isinstance(entry['name'],str) or not 1<=len(entry['name'])<=80:raise ConfigError()
+        # Fixed messages: env values are credentials and never reach errors.
+        try:local_stdio.validate_launch(entry['command'],entry['args'],entry['env'])
+        except ValueError:raise ConfigError('Invalid command, arguments or environment',422,'invalid_stdio_launch') from None
+        return copy.deepcopy(entry)
+
+    def _add_local(self,entry,version):
+        clean=self._local_entry(entry);sid=uuid.uuid4().hex[:12]
+        saved=self._change(version,lambda v:v['services'].update({sid:clean|{'id':sid,'discovery':[],'legacy_profile':None}}))
         return {'id':sid,'saved_version':saved}
 
     @staticmethod
@@ -92,7 +111,8 @@ class CatalogStore:
         ids=[]
         def change(v):
             for entry in entries:
-                if not isinstance(entry,dict) or set(entry)!={'name','url','transport','auth','private_network'}:raise ConfigError()
+                if isinstance(entry,dict) and entry.get('transport')==local_stdio.TRANSPORT:entry=self._local_entry(entry)
+                elif not isinstance(entry,dict) or set(entry)!={'name','url','transport','auth','private_network'}:raise ConfigError()
                 sid=uuid.uuid4().hex[:12];ids.append(sid)
                 v['services'][sid]=copy.deepcopy(entry)|{'id':sid,'discovery':[],'legacy_profile':None}
         saved=self._change(version,change)
@@ -129,13 +149,34 @@ class CatalogStore:
             for device in v['devices']:
                 for grant in device['bindings'].get(s['id'],[]):grant['schema_hash']='review-required'
 
+    def _update_local(self,v,s,patch):
+        if set(patch)-{'name','command','args','env'}:raise ConfigError()
+        update=copy.deepcopy(patch)
+        if 'env' in update:
+            env=update['env']
+            if not isinstance(env,dict):raise ConfigError()
+            # The form sends every kept name; an empty value keeps the stored secret, a missing name removes it.
+            update['env']={k:(s['env'][k] if val=='' and k in s['env'] else val) for k,val in env.items()}
+        entry={k:update.get(k,s[k]) for k in ('name','command','args','env')}|{'transport':local_stdio.TRANSPORT}
+        self._local_entry(entry)
+        changed=any(entry[k]!=s[k] for k in ('command','args','env'))
+        s.update({k:entry[k] for k in ('name','command','args','env')})
+        if changed:
+            # A different program or credential must never inherit grants just because schemas match.
+            s['discovery']=[]
+            for device in v['devices']:
+                for grant in device['bindings'].get(s['id'],[]):grant['schema_hash']='review-required'
+
     def update_service(self,sid,patch,version):
-        if not isinstance(patch,dict) or set(patch)-{'name','url','transport','auth','private_network','app_id','app_secret'}:raise ConfigError()
+        if not isinstance(patch,dict) or set(patch)-{'name','url','transport','auth','private_network','app_id','app_secret','command','args','env'}:raise ConfigError()
         affected=[]
         def change(v):
             s=self._service(v,sid)
             if feishu_readonly.is_feishu(s):
                 self._update_feishu(v,s,patch)
+                affected.extend(d['id'] for d in v['devices'] if sid in d['bindings']);return
+            if local_stdio.is_local(s):
+                self._update_local(v,s,patch)
                 affected.extend(d['id'] for d in v['devices'] if sid in d['bindings']);return
             if set(patch)-{'name','url','transport','auth','private_network'}:raise ConfigError()
             before=copy.deepcopy(s)
@@ -233,6 +274,9 @@ class CatalogStore:
                 if feishu_readonly.is_feishu(s):
                     if sid!=s['id']:raise ValueError()
                     feishu_readonly.validate_feishu_service(s);continue
+                if local_stdio.is_local(s):
+                    if sid!=s['id']:raise ValueError()
+                    local_stdio.validate_service(s);continue
                 if 'provider' in s or sid!=s['id'] or not isinstance(s['name'],str) or not 1<=len(s['name'])<=80 or s['transport'] not in ('streamable-http','sse') or type(s['private_network']) is not bool:raise ValueError()
                 validate_target(s['url'],s['private_network']);auth_headers(s['auth'])
                 if not isinstance(s['discovery'],list) or len(s['discovery'])>200:raise ValueError()

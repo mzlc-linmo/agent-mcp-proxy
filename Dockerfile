@@ -30,8 +30,9 @@ FROM base
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libsecret-1-0 \
  && rm -rf /var/lib/apt/lists/*
-# Only the node binary is shipped: no npm/npx/corepack at runtime.
-COPY --from=feishu-runtime /opt/feishu-node/bin/node /opt/feishu-node/bin/node
+# The pinned Node ships with npm/npx for local-program (stdio) services; the Feishu runtime still uses only node.
+COPY --from=feishu-runtime /opt/feishu-node/bin /opt/feishu-node/bin
+COPY --from=feishu-runtime /opt/feishu-node/lib /opt/feishu-node/lib
 COPY --from=feishu-runtime /opt/feishu-node/LICENSE /opt/feishu-node/LICENSE
 COPY --from=feishu-runtime /opt/feishu-mcp /opt/feishu-mcp
 RUN test ! -e /opt/feishu-mcp/.env \
@@ -40,7 +41,13 @@ RUN test ! -e /opt/feishu-mcp/.env \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY --chmod=644 proxy.py policy.py admin.py admin_auth.py admin_config.py lifecycle.py endpoint_manager.py catalog.py catalog_runtime.py service_transport.py service_import.py runtime.py feishu_readonly.py feishu_stdio.py ./
+# uv/uvx for PyPI packages; npm, uv and managed Python caches live under the writable cache volume.
+ARG UV_VERSION=0.13.6
+RUN pip install --no-cache-dir "uv==${UV_VERSION}" \
+ && test "$(uvx --version | cut -d' ' -f2)" = "${UV_VERSION}" \
+ && PATH=/opt/feishu-node/bin:/usr/bin:/bin npx --version \
+ && mkdir -p /var/cache/agent-mcp-proxy && chown 65534:65534 /var/cache/agent-mcp-proxy && chmod 700 /var/cache/agent-mcp-proxy
+COPY --chmod=644 proxy.py policy.py admin.py admin_auth.py admin_config.py lifecycle.py endpoint_manager.py catalog.py catalog_runtime.py service_transport.py service_import.py runtime.py feishu_readonly.py feishu_stdio.py local_stdio.py stdio_runtime.py ./
 COPY --chmod=644 static/ ./static/
 RUN chmod 755 /app /app/static
 USER 65534:65534

@@ -14,12 +14,23 @@ services:
       ADMIN_ORIGIN: "http://${BRIDGE_ADMIN_BIND_IP:?Set LAN bind address}:${BRIDGE_ADMIN_PORT:-18082}"
       ADMIN_ALLOWED_UPSTREAM_ORIGIN: http://higress:8080
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      # Local-program (stdio) services: shared process ceiling (Feishu included) and first-install window in seconds.
+      STDIO_PROCESS_LIMIT: ${STDIO_PROCESS_LIMIT:-10}
+      STDIO_START_TIMEOUT: ${STDIO_START_TIMEOUT:-300}
+      # Optional proxy and package mirrors for local programs only; empty values are not passed on.
+      STDIO_HTTPS_PROXY: ${STDIO_HTTPS_PROXY:-}
+      STDIO_HTTP_PROXY: ${STDIO_HTTP_PROXY:-}
+      STDIO_NO_PROXY: ${STDIO_NO_PROXY:-}
+      STDIO_NPM_REGISTRY: ${STDIO_NPM_REGISTRY:-}
+      STDIO_PYPI_INDEX: ${STDIO_PYPI_INDEX:-}
     ports:
       - "${BRIDGE_ADMIN_BIND_IP:?Set LAN bind address}:${BRIDGE_ADMIN_PORT:-18082}:8082"
     volumes:
       - ./config.example.json:/app/config.json:ro
       - ./secrets:/run/secrets:ro
       - ./runtime:/var/lib/linmo-proxy:rw
+      # npm/uv package caches and each local program's home; must be writable by BRIDGE_UID.
+      - ./cache:/var/cache/agent-mcp-proxy:rw
     networks: [linmo]
     logging:
       driver: json-file

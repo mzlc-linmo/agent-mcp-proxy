@@ -122,8 +122,8 @@ class FeishuCatalogTests(unittest.TestCase):
         raw['services'][sid]['discovery'].pop();raw['services'][sid]['command']='/bin/sh';self.store.path.write_text(json.dumps(raw))
         with self.assertRaises(ConfigError):self.store.load()
         raw['services'][sid].pop('command');self.store.path.write_text(json.dumps(raw));self.store.load()
-        # External JSON/descriptor import still cannot create stdio entries.
-        for document in ({'mcpServers':{'lark':{'command':'npx','args':['-y','@larksuiteoapi/lark-mcp']}}},{'mcpServers':{'lark':{'type':'stdio','url':'https://example.com/mcp'}}},{'connections':[{'name':'lark','transport':'stdio','url':'https://example.com/mcp'}]},{'mcpServers':{'lark':{'url':'https://example.com/mcp','provider':'feishu-readonly'}}}):
+        # Import cannot create Feishu entries or stdio without a command (plain command imports are allowed since CMP-395).
+        for document in ({'mcpServers':{'lark':{'type':'stdio','url':'https://example.com/mcp'}}},{'connections':[{'name':'lark','transport':'stdio','url':'https://example.com/mcp'}]},{'mcpServers':{'lark':{'url':'https://example.com/mcp','provider':'feishu-readonly'}}}):
             with self.subTest(document=document):self.assertEqual(self.client.post('/api/services/import',json={'version':self.version(),'document':document},headers=self.headers).status_code,422)
         entries=[{'name':'lark','provider':'feishu-readonly','transport':'stdio','app_id':'a','app_secret':'b'}]
         with self.assertRaises(ConfigError):self.store.import_services(entries,self.version())

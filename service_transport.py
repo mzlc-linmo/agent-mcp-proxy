@@ -17,6 +17,8 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.client.sse import sse_client
 import feishu_readonly
 import feishu_stdio
+import local_stdio
+import stdio_runtime
 
 class TargetError(ValueError):pass
 
@@ -94,6 +96,9 @@ async def service_session(service):
     if feishu_readonly.is_feishu(service):
         async with feishu_stdio.session(service) as session:yield session
         return
+    if local_stdio.is_local(service):
+        async with stdio_runtime.session(service) as session:yield session
+        return
     url=service['url'];private=service.get('private_network',False);headers=auth_headers(service.get('auth',{'mode':'none'}))
     if service.get('transport','streamable-http')=='sse':
         def factory(headers=None,timeout=None,auth=None):
@@ -107,11 +112,17 @@ async def service_session(service):
                 async with ClientSession(streams[0],streams[1]) as session:
                     await session.initialize();yield session
 
-async def discover_service(service):
+def session_timeout(service,base):
+    """Local programs may download their package on first start, so they get the configured start window."""
+    return stdio_runtime.START_TIMEOUT+base if local_stdio.is_local(service) else base
+
+async def discover_service(service,reinstall=False):
     from proxy import secure_logging
     secure_logging();tools=[];size=0;cursor=None
-    slot=feishu_stdio.discovery_slot(service['id']) if feishu_readonly.is_feishu(service) else contextlib.nullcontext()
-    async with asyncio.timeout(30),slot:
+    if feishu_readonly.is_feishu(service):slot=feishu_stdio.discovery_slot(service['id'])
+    elif local_stdio.is_local(service):slot=stdio_runtime.tracked_discovery(service,reinstall)
+    else:slot=contextlib.nullcontext()
+    async with slot,asyncio.timeout(session_timeout(service,30)):
         async with service_session(service) as session:
             for _ in range(20):
                 page=await session.list_tools(cursor=cursor)

@@ -1,6 +1,6 @@
 # Agent MCP Proxy
 
-面向小智设备的出站 MCP 代理，提供设备管理、共享 MCP 服务目录和逐设备工具授权。设备端通过小智 WSS 接入，上游支持 Streamable HTTP / SSE；管理端使用 FastAPI 和本地静态页面，不依赖前端构建工具。
+面向小智设备的出站 MCP 代理，提供设备管理、共享 MCP 服务目录和逐设备工具授权。设备端通过小智 WSS 接入，上游支持 Streamable HTTP / SSE 和容器内运行的本地程序（stdio，`npx` / `uvx`）；管理端使用 FastAPI 和本地静态页面，不依赖前端构建工具。
 
 > **安全边界**：管理页默认是明文 HTTP，只应绑定本机或可信局域网。这个项目不是“所有工具只能只读”的代理：管理员可以授权有真实副作用的工具。WSS 已连接、工具发现成功，都不代表业务权限或实际业务调用已经验证。
 
@@ -14,12 +14,14 @@
                        私有配置与设备授权
                               │
 小智平台 ◀── 出站 WSS ── 每设备独立桥接 ── HTTP/SSE ── MCP 服务
-                                   └──── stdio ── 容器内固定飞书官方程序（只读）
+                                   ├──── stdio ── 容器内固定飞书官方程序（只读）
+                                   └──── stdio ── 本地插件（npx / uvx 等，首次发现时安装）
 ```
 
 - **设备管理**：新增、编辑、停用、删除与单设备应用；最多 10 台。每台设备必须使用不同的小智 WSS 地址，新增设备默认停用、无工具授权。
 - **共享服务目录**：最多 20 个服务，不限于 Higress。支持手动添加、JSON 导入和通过描述 JSON URL 导入；添加服务不自动授权设备。
 - **传输与认证**：Streamable HTTP、SSE；无认证、Bearer Token、自定义 Header 的 API Key。
+- **本地插件（stdio）**：填写命令、参数和环境变量，或导入 Claude Desktop / Cursor / 魔搭的 `mcpServers` 写法和官方 MCP Registry 的 `server.json`（npm → `npx -y 包@版本`，PyPI → `uvx 包==版本`）。镜像内置 Node.js 22（含 npm/npx）和 uv/uvx；首次发现时下载，缓存在 `cache/` 目录。详见第 5 节“本地插件”。
 - **飞书只读**：内置固定接入，以飞书应用身份（`tenant_access_token`）运行镜像内锁定版本的官方 `@larksuiteoapi/lark-mcp` 0.5.1，只提供 6 个只读工具；详见[飞书只读接入](<doc/飞书只读接入.md>)。
 - **工具授权**：正常新授权先发现工具，再逐设备选择；发现快照与授权记录包含参数 Schema 哈希，Schema 改变后须重新复核。旧四域迁移授权有兼容例外，见第 3.4 节；不同服务的同名工具使用稳定别名隔离。
 - **连接管理**：设备使用独立 MCP 会话；应用时先关闭该设备旧连接，再创建新连接。断线按 1～60 秒退避重连，不缓存或自动重放工具调用。
@@ -31,9 +33,9 @@
 | 项目 | 当前行为 |
 | --- | --- |
 | 设备平台 | 仅支持 `wss://api.xiaozhi.me/mcp/?token=…`，不是通用 WebSocket 网关 |
-| 上游服务 | 除内置飞书只读外，不支持任意 stdio 命令、执行软件包、OAuth 自动登录；飞书只读不支持用户身份和写操作 |
+| 上游服务 | 不支持 OAuth 自动登录；本地插件只能运行代理容器里有的命令（镜像带 `node`/`npx`/`uvx`/`python`），不接受 `cwd`、`envFile`；飞书只读不支持用户身份和写操作 |
 | MCP 内容 | 仅转发已授权的工具；没有资源/提示词代理功能 |
-| 通用工具结果 | 只接受文本内容，合并后不得超过 1024 个 UTF-8 字节；图片、文件等非文本结果或超限结果返回错误，不静默截断 |
+| 通用工具结果 | 只接受文本内容，合并后不得超过 1024 个 UTF-8 字节；图片、文件等非文本结果或超限结果返回错误，不静默截断。本地插件同样适用：读文件、抓网页这类常返回长文本的插件多数调用会超限 |
 | 工具发现 | 每服务最多 200 个工具、20 页、约 2 MiB 快照；只初始化和列工具，不调用业务工具 |
 | 管理账号 | 单管理员，无多用户角色系统或说话人身份识别；上游调用使用所配置的服务凭据 |
 | 部署健康 | Compose 未配置 Docker `healthcheck`；容器 `Up` 或 `compose up --wait` 不能代替 HTTP、WSS 和业务验收 |
@@ -47,7 +49,8 @@
 | [catalog.py](<catalog.py>)、[admin_config.py](<admin_config.py>) | v3 服务目录、设备授权、旧配置迁移与原子保存 |
 | [endpoint_manager.py](<endpoint_manager.py>)、[lifecycle.py](<lifecycle.py>)、[catalog_runtime.py](<catalog_runtime.py>) | 每设备连接生命周期、工具发布与调用转发 |
 | [service_transport.py](<service_transport.py>)、[service_import.py](<service_import.py>) | HTTP/SSE、安全目标校验与配置导入 |
-| [feishu_readonly.py](<feishu_readonly.py>)、[feishu_stdio.py](<feishu_stdio.py>)、[feishu-runtime/](<feishu-runtime/package.json>) | 飞书只读的固定工具白名单与启动参数、stdio 进程配额与清理、锁定的官方 npm 包 |
+| [local_stdio.py](<local_stdio.py>)、[stdio_runtime.py](<stdio_runtime.py>) | 本地插件的命令/参数/环境变量校验与启动环境；全部 stdio 进程（含飞书）的共用上限、启动日志、安装状态、失败原因脱敏与缓存清理 |
+| [feishu_readonly.py](<feishu_readonly.py>)、[feishu_stdio.py](<feishu_stdio.py>)、[feishu-runtime/](<feishu-runtime/package.json>) | 飞书只读的固定工具白名单与启动参数、锁定的官方 npm 包 |
 | [policy.py](<policy.py>)、[proxy.py](<proxy.py>) | 原业务域的工具集合/结果裁剪及旧桥接兼容逻辑；`python proxy.py` 不是当前管理版启动方式 |
 | [bootstrap_admin.py](<doc/bootstrap_admin.py>)、[admin_auth.py](<admin_auth.py>) | 交互初始化管理员、密码哈希、会话与登录限流 |
 | [index.html](<static/index.html>)、[admin.js](<static/admin.js>)、[admin.css](<static/admin.css>) | 无需编译的管理页面 |
@@ -105,6 +108,7 @@ secrets/                       /run/secrets/                  只读挂载，目
 secrets/admin_hash             /run/secrets/admin_hash        文件 0600
 runtime/                       /var/lib/linmo-proxy/           可写挂载，目录 0700
 runtime/config.json            /var/lib/linmo-proxy/config.json  私有配置，文件 0600
+cache/                         /var/cache/agent-mcp-proxy/    可写挂载，本地插件的 npm/uv 缓存和各服务 HOME
 config.example.json            /app/config.json               只读旧格式导入模板
 ```
 
@@ -159,7 +163,7 @@ docker compose up -d --no-deps agent-mcp-proxy
 docker compose ps
 ```
 
-当前镜像与容器名称：`linmo/agent-mcp-proxy:latest` / `agent-mcp-proxy`。首次构建需要联网获取固定摘要的基础镜像、Python 依赖、Node.js 22.23.4 官方归档（构建时校验 SHA256）和按锁文件安装的飞书官方 npm 包；构建需要 BuildKit（`docker compose build` 默认使用），只支持 Linux amd64 与 arm64，其他架构直接构建失败。运行时只带 `node` 程序，不含 npm/npx；管理页面静态资源已直接复制进镜像，无需前端构建。
+当前镜像与容器名称：`linmo/agent-mcp-proxy:latest` / `agent-mcp-proxy`。首次构建需要联网获取固定摘要的基础镜像、Python 依赖、Node.js 22.23.4 官方归档（构建时校验 SHA256）和按锁文件安装的飞书官方 npm 包；构建需要 BuildKit（`docker compose build` 默认使用），只支持 Linux amd64 与 arm64，其他架构直接构建失败。运行时带 `node`、`npm`/`npx`（同一份 Node.js 22.23.4）和 `uv`/`uvx` 0.13.6，供本地插件使用；飞书只读仍只用 `node` 启动锁定的官方包。管理页面静态资源已直接复制进镜像，无需前端构建。
 
 把下面 `ADMIN_URL` 改为环境文件中实际配置的地址；不要用另一个 Host 代测：
 
@@ -212,21 +216,44 @@ curl --noproxy '*' --silent --show-error --max-time 10 \
 }
 ```
 
-- 支持 `streamable-http` / `sse`，`http` / `streamablehttp` 作为前者的导入别名。
-- 可使用 `authMode`，或单个认证 Header；不能同时使用两套认证配置，不支持任意多个 Header、命令字段或环境变量展开。
+- 支持 `streamable-http` / `sse`，`http` / `streamablehttp` 作为前者的导入别名；带 `command` 的条目按本地插件导入（`type: "stdio"` 可省略），同一份 JSON 可混合两类。
+- 可使用 `authMode`，或单个认证 Header；不能同时使用两套认证配置，不支持任意多个 Header 或 HTTP 条目里的环境变量展开。
 - 私网目标须显式设置 `allowInsecurePrivateNetwork: true`。单次导入最多 20 个服务，保存后仍不授权任何设备。
 - 导入器接受但忽略 `disabled` 字段，不保留来源配置的停用状态；条目仍会加入服务目录，须显式发现并授权，不能用 `disabled: true` 作为本项目的停用或权限控制。
 - 可直接点击“确认导入”，页面会先校验并展示脱敏预览，再要求确认。
 - 描述 URL 仅允许通过公开 HTTPS 获取 JSON，不携带服务凭据，不接受重定向；描述内容仍须是上述支持格式，最大 64 KiB。“市场卡片”中填写的认证用于导入后的 MCP 服务，**不用于下载描述 JSON**。
 
+### 本地插件（stdio）
+
+手动添加时在“传输方式”选“本地程序（stdio）”，填写命令、参数（每行一个）和环境变量。也可以直接导入：
+
+```json
+{
+  "mcpServers": {
+    "time": { "command": "uvx", "args": ["mcp-server-time==2026.10.19"] },
+    "everything": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything@2.0.1"] },
+    "weather": { "command": "npx", "args": ["-y", "example-weather-mcp@1.0.0"], "env": { "WEATHER_API_KEY": "" } }
+  }
+}
+```
+
+- “导入 JSON”和“市场卡片”也接受官方 MCP Registry 的 `server.json`（含 `{"server": …}`、`{"servers": […]}` 外层）：取第一个 npm 或 PyPI 包，npm 生成 `npx -y 包@版本`，PyPI 生成 `uvx 包==版本`；没有可用包时退回其固定地址的 HTTP/SSE 远程。`environmentVariables`、`packageArguments` 和 `{变量}` 成为“待填项”；空值或 `<…>`、`${…}` 占位的环境变量也是待填项。必填项没填时预览提示、导入被拒绝（`422 import_inputs_required`）。
+- 导入、保存都不运行程序。**首次“发现工具”时安装**：页面显示“安装中”，结束后显示“可用”或“失败”及原因（程序最后 20 行输出，环境变量值已替换为 `***`）。“重新安装”清除该服务的 npm/uv 缓存后重新发现，保留该服务的 HOME 数据；删除服务时连同 HOME 一起删除。
+- 环境变量值按密钥处理：不回显，编辑时留空保留原值，不写日志。修改命令、参数或环境变量会清空发现快照，已授权设备的相关工具进入“待复核”，须重新发现、勾选保存并应用设备。
+- 命令不经 shell，在代理容器里以运行用户身份直接执行，没有命令白名单；容器里没有的命令返回“找不到命令”。每次启动写一行日志：`stdio start service=… id=… command=… args=…`，不含环境变量值。
+- 子进程环境只有固定项（`PATH`、`HOME`、缓存目录等）、可选的代理/镜像源和该服务自己的环境变量，不继承容器其他变量。
+- 全部 stdio 进程（本地插件和飞书只读，含发现）合计默认最多 10 个，用 `STDIO_PROCESS_LIMIT` 调整；每个约 50～150 MB 内存。首次安装/启动的等待时间默认 300 秒，用 `STDIO_START_TIMEOUT` 调整。
+- 版本请写死（`@版本`、`==版本`）：不写版本时，缓存过期后可能自动升级到新版本，工具 Schema 改变后授权会失效。
+
 ## 6. 安全措施与已知边界
 
 - **管理传输**：现有 Compose 不提供 TLS。HTTP 会明文传输密码、会话和新密钥；登录不能替代加密，不应直接暴露公网。更换域名、TLS 或反向代理须同步检查固定 Host/Origin 配置。
 - **账号与会话**：scrypt 哈希；登录按来源限流，10 分钟内 5 次失败后返回 `429`；会话有效期 24 小时，使用 HttpOnly / SameSite Cookie，修改 API 要求 CSRF Token。
-- **容器**：非 root、根文件系统只读、丢弃全部 capabilities、禁止提权；只有运行目录和受限临时目录可写。不挂载 Docker Socket。
+- **容器**：非 root、根文件系统只读、丢弃全部 capabilities、禁止提权；只有运行目录、本地插件缓存目录和受限临时目录可写。不挂载 Docker Socket。
 - **网络目标**：公网只接受 HTTPS。私网 IPv4/IPv6 需明确确认；私网 HTTP 支持私网 IP 和 Docker 单标签服务名（如 `higress`），不支持任意带点域名的 HTTP。回环、链路本地/元数据地址、多播等目标被拒绝；连接前校验全部 DNS 结果并将 TCP 连接固定到已校验 IP；拒绝跨源 MCP 请求和重定向。
 - **秘密与备份**：[.gitignore](<.gitignore>) 忽略秘密目录、运行目录和本机环境文件；[.dockerignore](<.dockerignore>) 排除秘密、运行配置及本机环境文件。私有配置仍以明文存储 WSS 和服务凭据，只靠文件权限保护，备份也必须同等保护。不要打印配置正文或分享完整日志。
-- **飞书只读**：只用固定绝对路径启动镜像内官方程序，不经 shell、不在运行时下载；参数固定为应用身份和 6 个只读工具，子进程环境只含固定项和该服务的 App ID/Secret；每次会话使用临时 HOME，结束即删除。全部设备合计最多 10 个飞书进程（含发现），每服务同一时间一次发现。结果须为文本且不超过 1024 字节；飞书 HTTP 200 但业务码非 0 的回复按失败处理，不转发飞书原文。
+- **本地插件**：管理员填写的命令以容器运行用户执行，能访问容器网络、读取该用户可读的文件，也能写缓存目录；只添加可信来源、写死版本的插件。容器其余部分仍为只读根、非 root、无 capabilities。HTTP/SSE 的目标校验不适用于本地插件自身的出站连接。
+- **飞书只读**：只用固定绝对路径启动镜像内官方程序，不经 shell、不在运行时下载；参数固定为应用身份和 6 个只读工具，子进程环境只含固定项和该服务的 App ID/Secret；每次会话使用临时 HOME，结束即删除。与本地插件共用 stdio 进程上限（默认 10，含发现），每服务同一时间一次发现。结果须为文本且不超过 1024 字节；飞书 HTTP 200 但业务码非 0 的回复按失败处理，不转发飞书原文。
 - **调用结果**：通用结果仅文本且限制 1024 字节；旧业务域经过 [policy.py](<policy.py>) 裁剪，列表保留 `total` / `returned` / `truncated`，首页结果不冒充全量。上游错误、超时、非文本或超限结果返回工具错误，不回显原始异常。
 - **真实副作用**：管理页授权工具后，代理没有逐次业务调用的独立二次授权机制，也不识别语音说话人的身份。应在授权前核对上游身份、最小权限和业务确认机制；超时可能已经执行，不能自动重试或重放。
 
@@ -252,6 +279,7 @@ docker compose stop agent-mcp-proxy
 ### 配置迁移与回滚
 
 - 读取旧 v1/v2 私有配置时，会先保留原内容到 [config.v2-backup.json](<runtime/config.v2-backup.json>)（默认路径，若该备份尚不存在），再原子迁为 v3；它是一次性迁移备份，不是每次保存的历史记录。该文件包含秘密，不要提交或分享。
+- 回滚到不含本地插件的旧镜像前：旧版本不认识本地插件条目，会拒绝整个配置。应先解除授权并删除全部本地插件服务，或恢复添加之前的完整配置备份；`cache/` 目录可在回滚后删除。
 - 回滚到不含飞书只读的旧镜像前：旧版本不认识飞书服务条目，会拒绝整个配置。应先在新版本解除授权并删除全部飞书只读服务，或恢复添加飞书服务之前的完整配置备份。
 - 回滚必须**先停止新代理**，再恢复相互匹配的镜像、Compose/环境文件、私有配置与秘密。旧版本不能直接指向 v3 配置；按升级前实际版本选择完整备份或对应迁移备份。
 - 不要在新代理运行时启动回滚容器；恢复后重新检查目录所有者、文件权限、绑定 IP、网络及管理/设备连接。
@@ -283,7 +311,7 @@ docker run --rm --network none --read-only --cap-drop ALL \
 
 ### 可选浏览器测试
 
-[test_browser_workflows.py](<test_browser_workflows.py>) 使用 Playwright 和合成 API，不依赖真实管理服务。Playwright 不在运行依赖内；未安装 Python 包时 11 个浏览器用例跳过。**如果包已安装而 Chromium 缺失，则会失败而非跳过。** 在开发虚拟环境按需执行：
+[test_browser_workflows.py](<test_browser_workflows.py>) 使用 Playwright 和合成 API，不依赖真实管理服务。Playwright 不在运行依赖内；未安装 Python 包时 12 个浏览器用例跳过。**如果包已安装而 Chromium 缺失，则会失败而非跳过。** 在开发虚拟环境按需执行：
 
 ```bash
 python -m pip install playwright
@@ -298,6 +326,14 @@ python -m unittest test_browser_workflows
 ```bash
 docker build -t linmo/agent-mcp-proxy:feishu-test .
 FEISHU_TEST_IMAGE=linmo/agent-mcp-proxy:feishu-test PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest test_feishu_image
+```
+
+### 本地插件镜像验收
+
+[test_stdio_image.py](<test_stdio_image.py>) 只在显式设置 `STDIO_TEST_IMAGE` 时运行，**需要联网**（npm 和 PyPI），默认跳过。它以只读根、非 root、受限 `/tmp` 和一次性缓存运行镜像，经正式代码路径真实安装固定版本的 `@modelcontextprotocol/server-everything@2.0.1`（npx）和 `mcp-server-time==2026.10.19`（uvx），列出工具、各调用一个无副作用工具，再验证重新安装、找不到命令、启动日志不含环境变量值和进程回收。需要镜像源时设置 `STDIO_TEST_NPM_REGISTRY`、`STDIO_TEST_PYPI_INDEX` 或 `STDIO_TEST_HTTPS_PROXY`。
+
+```bash
+STDIO_TEST_IMAGE=linmo/agent-mcp-proxy:feishu-test PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest test_stdio_image
 ```
 
 ### 本次核对的验证记录
@@ -316,6 +352,9 @@ FEISHU_TEST_IMAGE=linmo/agent-mcp-proxy:feishu-test PYTHONDONTWRITEBYTECODE=1 .v
 | 保存成功但连接未变 | 尚未应用目标设备，或只更新了共享服务；重新发现/复核授权后应用受影响设备 |
 | `connected` 但无工具 | 检查发现快照、设备勾选授权、Schema 哈希、上游可用性与实际发布列表 |
 | 发现成功但调用失败 | 业务权限可能不足，或结果为非文本/超长；未知执行结果不能直接重试 |
+| 本地插件“找不到命令” | 容器里没有该程序；镜像只带 `node`/`npx`/`uvx`/`python`，`docker`、`bunx`、`deno` 等不在其中 |
+| 本地插件安装失败或超时 | 页面失败原因里的程序输出；检查容器能否访问 npm/PyPI，必要时设置 `STDIO_HTTPS_PROXY`、`STDIO_NPM_REGISTRY`、`STDIO_PYPI_INDEX`；`cache/` 目录是否可由 `BRIDGE_UID` 写入 |
+| 本地插件“进程已达上限” | 全部 stdio 进程合计达到 `STDIO_PROCESS_LIMIT`；停用不用的设备、稍后重试或调大上限 |
 | `durability_unconfirmed` | 原子替换已经提交，但目录持久化确认失败；应检查存储可靠性，不要误判为保存已回滚 |
 
 ## 10. 当前本机部署快照
