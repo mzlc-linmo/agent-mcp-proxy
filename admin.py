@@ -176,8 +176,12 @@ def create_app(store,manager,auth,allowed_origin):
         config=await current(request)
         if sid not in config['services']:raise ConfigError('Service not found',404)
         from service_transport import discover_service
+        from feishu_stdio import error_code,MESSAGES
         try:tools=await discover_service(config['services'][sid])
-        except Exception:raise ConfigError('Service discovery unavailable or rejected',502) from None
+        except Exception as error:
+            code=error_code(error)
+            if code:raise ConfigError(MESSAGES[code],429 if code in ('feishu_discovery_busy','feishu_capacity') else 503,code) from None
+            raise ConfigError('Service discovery unavailable or rejected',502) from None
         return {'saved_version':store.record_discovery(sid,tools,config['version']),'discovered':len(tools)}
 
     @app.get('/api/devices')

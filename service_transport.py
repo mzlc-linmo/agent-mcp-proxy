@@ -1,5 +1,6 @@
 """MCP transport boundary: validate every resolved destination and pin TCP connections."""
 import asyncio
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -14,6 +15,8 @@ from httpcore._backends.anyio import AnyIOBackend
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.client.sse import sse_client
+import feishu_readonly
+import feishu_stdio
 
 class TargetError(ValueError):pass
 
@@ -87,6 +90,10 @@ class CoreStream(httpx.AsyncByteStream):
 
 @asynccontextmanager
 async def service_session(service):
+    # The Feishu branch is chosen before any HTTP url/auth field is read.
+    if feishu_readonly.is_feishu(service):
+        async with feishu_stdio.session(service) as session:yield session
+        return
     url=service['url'];private=service.get('private_network',False);headers=auth_headers(service.get('auth',{'mode':'none'}))
     if service.get('transport','streamable-http')=='sse':
         def factory(headers=None,timeout=None,auth=None):
@@ -103,7 +110,8 @@ async def service_session(service):
 async def discover_service(service):
     from proxy import secure_logging
     secure_logging();tools=[];size=0;cursor=None
-    async with asyncio.timeout(30):
+    slot=feishu_stdio.discovery_slot(service['id']) if feishu_readonly.is_feishu(service) else contextlib.nullcontext()
+    async with asyncio.timeout(30),slot:
         async with service_session(service) as session:
             for _ in range(20):
                 page=await session.list_tools(cursor=cursor)

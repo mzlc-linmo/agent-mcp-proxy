@@ -45,9 +45,12 @@ class EndpointManager:
     async def test(self,config):
         if config.get('schema_version')==3:
             from service_transport import discover_service
+            from feishu_stdio import error_code
             result={}
             for sid,service in config['services'].items():
                 try:result[sid]={'state':'discovered','count':len(await discover_service(service))}
-                except Exception:result[sid]={'state':'unavailable'}
+                except Exception as error:
+                    code=error_code(error)
+                    result[sid]={'state':'unavailable'}|({'error_code':code} if code else {})
             return result
         return await discover(config)
