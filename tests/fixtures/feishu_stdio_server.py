@@ -37,6 +37,8 @@ def call(name,arguments):
     kind=arguments.get('mode','ok')
     if kind=='hang':time.sleep(3600)
     if kind=='denied':return {'isError':True,'content':[{'type':'text','text':'permission denied for app %s'%os.environ.get('APP_SECRET')}]}
+    # HTTP 200 with a non-zero Feishu code: the official handler forwards the body without isError.
+    if kind=='business':return {'content':[{'type':'text','text':json.dumps({'code':99991672,'msg':'Access denied for %s'%os.environ.get('APP_SECRET')})}]}
     if kind=='image':return {'content':[{'type':'image','data':'AAAA','mimeType':'image/png'}]}
     if kind=='bytes':return {'content':[{'type':'text','text':'a'*int(arguments.get('page_size',0))}]}
     if kind=='chinese':return {'content':[{'type':'text','text':'中'*int(arguments.get('page_size',0))}]}

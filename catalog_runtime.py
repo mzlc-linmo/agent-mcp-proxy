@@ -21,6 +21,29 @@ FEISHU_ERRORS={'rejected':'Feishu read-only call rejected or failed (check app p
     'too_large':'Feishu result exceeds 1024 bytes; narrow the query (smaller page_size or range); no automatic replay'}
 
 
+def _feishu_business_error(text):
+    """The official handler returns an HTTP 200 body unchanged when it has no data field, so a non-zero code there is a failure."""
+    try:value=json.loads(text)
+    except ValueError:return False
+    return isinstance(value,dict) and 'code' in value and value['code']!=0
+
+
+async def call_feishu(session,service,original,arguments):
+    def failure(kind):return types.CallToolResult(isError=True,content=[types.TextContent(type='text',text=FEISHU_ERRORS[kind])])
+    # Checked again immediately before forwarding; the hint in descriptions is not the guard.
+    if not feishu_readonly.tool_allowed(service,original):return failure('rejected')
+    try:
+        async with asyncio.timeout(20):result=await session.call_tool(original,arguments)
+    except Exception:return failure('rejected')
+    # Upstream error text can reflect request data, so it is never forwarded.
+    if result.isError:return failure('rejected')
+    if not result.content or any(not isinstance(c,types.TextContent) for c in result.content):return failure('unsupported')
+    text='\n'.join(c.text for c in result.content)
+    if _feishu_business_error(text):return failure('rejected')
+    if len(text.encode())>1024:return failure('too_large')
+    return types.CallToolResult(isError=False,content=[types.TextContent(type='text',text=text)])
+
+
 def device_snapshot(config,eid):
     device=next((d for d in config['devices'] if d['id']==eid),None)
     if device is None:raise ConfigError('Device not found',404)
@@ -86,20 +109,6 @@ async def bridge_catalog(config,report):
 
         @server.list_tools()
         async def list_tools():return published
-
-        async def call_feishu(session,service,original,arguments):
-            def failure(kind):return types.CallToolResult(isError=True,content=[types.TextContent(type='text',text=FEISHU_ERRORS[kind])])
-            # Checked again immediately before forwarding; the hint in descriptions is not the guard.
-            if not feishu_readonly.tool_allowed(service,original):return failure('rejected')
-            try:
-                async with asyncio.timeout(20):result=await session.call_tool(original,arguments)
-            except Exception:return failure('rejected')
-            # Upstream error text can reflect request data, so it is never forwarded.
-            if result.isError:return failure('rejected')
-            if not result.content or any(not isinstance(c,types.TextContent) for c in result.content):return failure('unsupported')
-            text='\n'.join(c.text for c in result.content)
-            if len(text.encode())>1024:return failure('too_large')
-            return types.CallToolResult(isError=False,content=[types.TextContent(type='text',text=text)])
 
         @server.call_tool()
         async def call_tool(name,arguments):

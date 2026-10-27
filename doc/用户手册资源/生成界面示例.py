@@ -52,6 +52,14 @@ async def main():
                     await page.get_by_role('combobox', name='鉴权方式', exact=True).select_option('bearer')
                 await page.locator('#view section').screenshot(path=str(OUT / filename))
                 print('Captured synthetic UI:', filename)
+            # Feishu read-only service: synthetic App ID only; the secret is never part of the public projection.
+            feishu_tools = [{'name': n, 'description': d, 'inputSchema': {'type': 'object'}, 'schema_hash': 'demo', 'annotations': {'readOnlyHint': True}} for n, d in [('im_v1_chat_list', '演示：列出应用所在的群'), ('docx_v1_document_rawContent', '演示：读取文档纯文本')]]
+            cfg['services']['feishu-demo'] = {'id': 'feishu-demo', 'name': '飞书只读（演示）', 'provider': 'feishu-readonly', 'transport': 'stdio', 'app_id': 'cli_demo_app', 'app_secret_configured': True, 'discovery': feishu_tools}
+            await page.goto('http://manual.local/#/services/feishu-demo')
+            await page.reload()
+            await expect(page.get_by_role('textbox', name='App ID', exact=True)).to_have_value('cli_demo_app')
+            await page.locator('#view section').screenshot(path=str(OUT / '06-飞书只读示例.png'))
+            print('Captured synthetic UI:', '06-飞书只读示例.png')
         finally:
             await browser.close()
 

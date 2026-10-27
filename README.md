@@ -14,11 +14,13 @@
                        私有配置与设备授权
                               │
 小智平台 ◀── 出站 WSS ── 每设备独立桥接 ── HTTP/SSE ── MCP 服务
+                                   └──── stdio ── 容器内固定飞书官方程序（只读）
 ```
 
 - **设备管理**：新增、编辑、停用、删除与单设备应用；最多 10 台。每台设备必须使用不同的小智 WSS 地址，新增设备默认停用、无工具授权。
 - **共享服务目录**：最多 20 个服务，不限于 Higress。支持手动添加、JSON 导入和通过描述 JSON URL 导入；添加服务不自动授权设备。
 - **传输与认证**：Streamable HTTP、SSE；无认证、Bearer Token、自定义 Header 的 API Key。
+- **飞书只读**：内置固定接入，以飞书应用身份（`tenant_access_token`）运行镜像内锁定版本的官方 `@larksuiteoapi/lark-mcp` 0.5.1，只提供 6 个只读工具；详见[飞书只读接入](<doc/飞书只读接入.md>)。
 - **工具授权**：正常新授权先发现工具，再逐设备选择；发现快照与授权记录包含参数 Schema 哈希，Schema 改变后须重新复核。旧四域迁移授权有兼容例外，见第 3.4 节；不同服务的同名工具使用稳定别名隔离。
 - **连接管理**：设备使用独立 MCP 会话；应用时先关闭该设备旧连接，再创建新连接。断线按 1～60 秒退避重连，不缓存或自动重放工具调用。
 - **管理页面**：中文/英文、亮色/暗色、设备状态、工具发现、服务配置与工具授权。
@@ -29,7 +31,7 @@
 | 项目 | 当前行为 |
 | --- | --- |
 | 设备平台 | 仅支持 `wss://api.xiaozhi.me/mcp/?token=…`，不是通用 WebSocket 网关 |
-| 上游服务 | 不支持 stdio、执行命令/软件包、OAuth 自动登录 |
+| 上游服务 | 除内置飞书只读外，不支持任意 stdio 命令、执行软件包、OAuth 自动登录；飞书只读不支持用户身份和写操作 |
 | MCP 内容 | 仅转发已授权的工具；没有资源/提示词代理功能 |
 | 通用工具结果 | 只接受文本内容，合并后不得超过 1024 个 UTF-8 字节；图片、文件等非文本结果或超限结果返回错误，不静默截断 |
 | 工具发现 | 每服务最多 200 个工具、20 页、约 2 MiB 快照；只初始化和列工具，不调用业务工具 |
@@ -45,6 +47,7 @@
 | [catalog.py](<catalog.py>)、[admin_config.py](<admin_config.py>) | v3 服务目录、设备授权、旧配置迁移与原子保存 |
 | [endpoint_manager.py](<endpoint_manager.py>)、[lifecycle.py](<lifecycle.py>)、[catalog_runtime.py](<catalog_runtime.py>) | 每设备连接生命周期、工具发布与调用转发 |
 | [service_transport.py](<service_transport.py>)、[service_import.py](<service_import.py>) | HTTP/SSE、安全目标校验与配置导入 |
+| [feishu_readonly.py](<feishu_readonly.py>)、[feishu_stdio.py](<feishu_stdio.py>)、[feishu-runtime/](<feishu-runtime/package.json>) | 飞书只读的固定工具白名单与启动参数、stdio 进程配额与清理、锁定的官方 npm 包 |
 | [policy.py](<policy.py>)、[proxy.py](<proxy.py>) | 原业务域的工具集合/结果裁剪及旧桥接兼容逻辑；`python proxy.py` 不是当前管理版启动方式 |
 | [bootstrap_admin.py](<doc/bootstrap_admin.py>)、[admin_auth.py](<admin_auth.py>) | 交互初始化管理员、密码哈希、会话与登录限流 |
 | [index.html](<static/index.html>)、[admin.js](<static/admin.js>)、[admin.css](<static/admin.css>) | 无需编译的管理页面 |
@@ -156,7 +159,7 @@ docker compose up -d --no-deps agent-mcp-proxy
 docker compose ps
 ```
 
-当前镜像与容器名称：`linmo/agent-mcp-proxy:latest` / `agent-mcp-proxy`。首次构建需要联网获取基础镜像和 Python 依赖；管理页面静态资源已直接复制进镜像，无需 Node.js 或前端构建。
+当前镜像与容器名称：`linmo/agent-mcp-proxy:latest` / `agent-mcp-proxy`。首次构建需要联网获取固定摘要的基础镜像、Python 依赖、Node.js 22.23.4 官方归档（构建时校验 SHA256）和按锁文件安装的飞书官方 npm 包；构建需要 BuildKit（`docker compose build` 默认使用），只支持 Linux amd64 与 arm64，其他架构直接构建失败。运行时只带 `node` 程序，不含 npm/npx；管理页面静态资源已直接复制进镜像，无需前端构建。
 
 把下面 `ADMIN_URL` 改为环境文件中实际配置的地址；不要用另一个 Host 代测：
 
@@ -223,6 +226,7 @@ curl --noproxy '*' --silent --show-error --max-time 10 \
 - **容器**：非 root、根文件系统只读、丢弃全部 capabilities、禁止提权；只有运行目录和受限临时目录可写。不挂载 Docker Socket。
 - **网络目标**：公网只接受 HTTPS。私网 IPv4/IPv6 需明确确认；私网 HTTP 支持私网 IP 和 Docker 单标签服务名（如 `higress`），不支持任意带点域名的 HTTP。回环、链路本地/元数据地址、多播等目标被拒绝；连接前校验全部 DNS 结果并将 TCP 连接固定到已校验 IP；拒绝跨源 MCP 请求和重定向。
 - **秘密与备份**：[.gitignore](<.gitignore>) 忽略秘密目录、运行目录和本机环境文件；[.dockerignore](<.dockerignore>) 排除秘密、运行配置及本机环境文件。私有配置仍以明文存储 WSS 和服务凭据，只靠文件权限保护，备份也必须同等保护。不要打印配置正文或分享完整日志。
+- **飞书只读**：只用固定绝对路径启动镜像内官方程序，不经 shell、不在运行时下载；参数固定为应用身份和 6 个只读工具，子进程环境只含固定项和该服务的 App ID/Secret；每次会话使用临时 HOME，结束即删除。全部设备合计最多 10 个飞书进程（含发现），每服务同一时间一次发现。结果须为文本且不超过 1024 字节；飞书 HTTP 200 但业务码非 0 的回复按失败处理，不转发飞书原文。
 - **调用结果**：通用结果仅文本且限制 1024 字节；旧业务域经过 [policy.py](<policy.py>) 裁剪，列表保留 `total` / `returned` / `truncated`，首页结果不冒充全量。上游错误、超时、非文本或超限结果返回工具错误，不回显原始异常。
 - **真实副作用**：管理页授权工具后，代理没有逐次业务调用的独立二次授权机制，也不识别语音说话人的身份。应在授权前核对上游身份、最小权限和业务确认机制；超时可能已经执行，不能自动重试或重放。
 
@@ -248,6 +252,7 @@ docker compose stop agent-mcp-proxy
 ### 配置迁移与回滚
 
 - 读取旧 v1/v2 私有配置时，会先保留原内容到 [config.v2-backup.json](<runtime/config.v2-backup.json>)（默认路径，若该备份尚不存在），再原子迁为 v3；它是一次性迁移备份，不是每次保存的历史记录。该文件包含秘密，不要提交或分享。
+- 回滚到不含飞书只读的旧镜像前：旧版本不认识飞书服务条目，会拒绝整个配置。应先在新版本解除授权并删除全部飞书只读服务，或恢复添加飞书服务之前的完整配置备份。
 - 回滚必须**先停止新代理**，再恢复相互匹配的镜像、Compose/环境文件、私有配置与秘密。旧版本不能直接指向 v3 配置；按升级前实际版本选择完整备份或对应迁移备份。
 - 不要在新代理运行时启动回滚容器；恢复后重新检查目录所有者、文件权限、绑定 IP、网络及管理/设备连接。
 - 本项目没有一键回滚命令。管理员密码丢失或哈希轮换也没有网页自助入口，应在停服务、备份并明确授权后处理，不能随意删除哈希后覆盖初始化。
@@ -278,12 +283,21 @@ docker run --rm --network none --read-only --cap-drop ALL \
 
 ### 可选浏览器测试
 
-[test_browser_workflows.py](<test_browser_workflows.py>) 使用 Playwright 和合成 API，不依赖真实管理服务。Playwright 不在运行依赖内；未安装 Python 包时 7 个浏览器用例跳过。**如果包已安装而 Chromium 缺失，则会失败而非跳过。** 在开发虚拟环境按需执行：
+[test_browser_workflows.py](<test_browser_workflows.py>) 使用 Playwright 和合成 API，不依赖真实管理服务。Playwright 不在运行依赖内；未安装 Python 包时 11 个浏览器用例跳过。**如果包已安装而 Chromium 缺失，则会失败而非跳过。** 在开发虚拟环境按需执行：
 
 ```bash
 python -m pip install playwright
 python -m playwright install chromium
 python -m unittest test_browser_workflows
+```
+
+### 飞书镜像验收
+
+[test_feishu_image.py](<test_feishu_image.py>) 只在显式设置 `FEISHU_TEST_IMAGE` 时运行，普通全量发现中显示为跳过，不能当作通过。它以断网、只读根、非 root、受限 `/tmp` 运行镜像，只读挂载 `tests/image/`，用合成 App ID/Secret 启动正式入口，核对恰好 6 个只读工具、无监听端口和进程回收；再用测试专用 HTTP 应答层验证应用身份、请求路径和权限错误。不连接真实飞书。
+
+```bash
+docker build -t linmo/agent-mcp-proxy:feishu-test .
+FEISHU_TEST_IMAGE=linmo/agent-mcp-proxy:feishu-test PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest test_feishu_image
 ```
 
 ### 本次核对的验证记录

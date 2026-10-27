@@ -105,7 +105,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(data['token_mode'],'tenant_access_token');self.assertNotIn('code',data)
                 for alias in (self.sid+'__im_v1_message_create',aliases['bitable_v1_appTable_list'],'unknown'):
                     result=await call(alias,page_size=1);self.assertTrue(result.isError);self.assertEqual(result.content[0].text,'Tool not authorized')
-                for mode,size,ok in (('bytes',1024,True),('bytes',1025,False),('chinese',341,True),('chinese',342,False),('image',0,False),('denied',0,False)):
+                for mode,size,ok in (('bytes',1024,True),('bytes',1025,False),('chinese',341,True),('chinese',342,False),('image',0,False),('denied',0,False),('business',0,False)):
                     with self.subTest(mode=mode,size=size):
                         before=len(self.runtime.calls())
                         result=await call(aliases['docx_v1_document_rawContent'],mode=mode,page_size=size)
