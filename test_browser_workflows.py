@@ -412,4 +412,124 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(deletes,[{'version':2,'confirm_bound':True}])
             self.assertEqual(config['devices'],[]);self.assertEqual(errors,[])
 
+    async def test_feishu_form_redacts_secret_and_requires_explicit_device_apply(self):
+        async with async_playwright() as p:
+            browser=await p.chromium.launch(headless=True);self.addAsyncCleanup(browser.close)
+            page=await browser.new_page();errors=[];writes=[];secret='synthetic-feishu-ui-secret';failure={}
+            schema={'type':'object'}
+            http={'id':'http1','name':'HTTP one','url':'https://example.com/mcp','transport':'streamable-http','auth':{'mode':'none'},'private_network':False,'discovery':[{'name':'read','inputSchema':schema,'schema_hash':'h'}]}
+            cfg={'version':1,'services':{'http1':http},'devices':[{'id':'one','name':'Device one','enabled':True,'endpoint_configured':True,'bindings':{'http1':[{'name':'read','schema_hash':'h','alias':'http1__read'}]}}]}
+            tools=[{'name':n,'description':'只读','inputSchema':schema,'schema_hash':'fh'} for n in ('im_v1_chat_list','docx_v1_document_rawContent')]
+            async def handler(route):
+                url=route.request.url;method=route.request.method
+                if '/api/' not in url:
+                    filename='index.html' if url.split('#')[0]=='http://test.local/' else url.split('/static/')[-1]
+                    return await route.fulfill(path=str(Path(__file__).parent/'static'/filename))
+                path=url.split('/api/')[1]
+                if path=='session':return await route.fulfill(json={'csrf':'synthetic','username':'operator'})
+                if path=='config':return await route.fulfill(json=cfg)
+                if path=='status':return await route.fulfill(json={'endpoints':{}})
+                body=route.request.post_data_json;writes.append((method,path,body))
+                if failure.get(path):
+                    status,code=failure.pop(path);return await route.fulfill(status=status,json={'error':'x','error_code':code})
+                cfg['version']+=1;fs=cfg['services'].get('fs')
+                if (method,path)==('POST','services'):
+                    cfg['services']['fs']={'id':'fs','name':body['name'],'provider':'feishu-readonly','transport':'stdio','app_id':body['app_id'],'app_secret_configured':True,'discovery':[]}
+                    return await route.fulfill(json={'id':'fs','saved_version':cfg['version']})
+                if (method,path)==('PUT','services/fs'):
+                    fs.update(name=body['name'],app_id=body['app_id']);affected=[]
+                    if body['app_secret'] or body['app_id']!='cli_synthetic':
+                        fs['discovery']=[]
+                        for d in cfg['devices']:
+                            for g in d['bindings'].get('fs',[]):g['schema_hash']='review-required'
+                            if d['bindings'].get('fs'):affected.append(d['id'])
+                    return await route.fulfill(json={'saved_version':cfg['version'],'affected_device_ids':affected})
+                if (method,path)==('POST','services/fs/discover'):
+                    fs['discovery']=[dict(t) for t in tools];return await route.fulfill(json={'saved_version':cfg['version'],'discovered':2})
+                if (method,path)==('PUT','devices/one'):
+                    for sid,names in body.get('bindings',{}).items():cfg['devices'][0]['bindings'][sid]=[{'name':n,'schema_hash':'fh','alias':sid+'__'+n} for n in names]
+                    return await route.fulfill(json={'saved_version':cfg['version'],'requires_apply':True})
+                if (method,path)==('POST','devices/one/apply'):return await route.fulfill(status=202,json={'state':'applying'})
+                return await route.fulfill(status=500,json={'error':'unexpected'})
+            await page.route('http://test.local/**',handler)
+            page.on('dialog',lambda d:d.accept());page.on('pageerror',lambda error:errors.append(str(error)))
+            await page.goto('http://test.local/#/services/new')
+            await page.get_by_role('tab',name='飞书只读',exact=True).click()
+            await page.get_by_label('App ID',exact=True).wait_for()
+            labels=await page.locator('#view form label').all_inner_texts()
+            self.assertEqual([l.strip() for l in labels],['名称','App ID','App Secret'])
+            await expect(page.locator('#view p',has_text='应用身份 · 仅只读工具 · 运行于代理容器')).to_be_visible()
+            self.assertEqual(await page.get_by_label('App Secret',exact=True).get_attribute('type'),'password')
+            await page.get_by_label('名称',exact=True).fill('飞书只读')
+            await page.get_by_label('App ID',exact=True).fill('cli_synthetic')
+            await page.get_by_label('App Secret',exact=True).fill(secret)
+            await page.get_by_role('button',name='保存',exact=True).click()
+            await page.wait_for_function("location.hash==='#/services/fs'")
+            self.assertEqual(writes,[('POST','services',{'version':1,'name':'飞书只读','provider':'feishu-readonly','transport':'stdio','app_id':'cli_synthetic','app_secret':secret})])
+            secret_box=page.get_by_label('App Secret',exact=True)
+            await secret_box.wait_for()
+            self.assertEqual(await secret_box.input_value(),'');self.assertEqual(await secret_box.get_attribute('placeholder'),'凭据已配置，留空保留')
+            self.assertNotIn(secret,await page.content())
+            # Blank secret edit keeps it; discovery does not grant or apply anything.
+            await page.get_by_label('名称',exact=True).fill('飞书只读2')
+            await page.get_by_role('button',name='保存',exact=True).click()
+            await page.wait_for_function("document.getElementById('message').textContent.includes('已保存')")
+            self.assertEqual(writes[-1],('PUT','services/fs',{'version':2,'name':'飞书只读2','app_id':'cli_synthetic','app_secret':''}))
+            await page.get_by_role('button',name='发现工具（不执行工具）',exact=True).click()
+            await page.get_by_text('im_v1_chat_list',exact=True).wait_for()
+            self.assertEqual([w[:2] for w in writes],[('POST','services'),('PUT','services/fs'),('POST','services/fs/discover')])
+            # Busy/capacity/runtime errors show localized text and do not claim success.
+            for status,code,text in ((429,'feishu_discovery_busy','该服务正在发现工具'),(429,'feishu_capacity','飞书进程已达上限'),(503,'feishu_runtime_unavailable','飞书运行环境不可用'),(503,'feishu_session_unavailable','飞书连接失败')):
+                failure['services/fs/discover']=(status,code)
+                await page.get_by_role('button',name='发现工具（不执行工具）',exact=True).click()
+                await page.wait_for_function("t=>document.getElementById('message').textContent.includes(t)",arg=text)
+                self.assertNotIn('已保存',await page.locator('#message').inner_text())
+                await expect(page.get_by_text('im_v1_chat_list',exact=True)).to_be_visible()
+            # Cards: identity badges, no URL; App ID is not searchable, name and ID are.
+            await page.goto('http://test.local/#/services')
+            card=page.locator('.service-card',has_text='飞书只读2')
+            for badge in ('飞书应用身份','stdio','只读'):await expect(card.locator('.badge',has_text=badge).first).to_be_visible()
+            self.assertNotIn('http',(await card.locator('p').inner_text()).lower())
+            search=page.get_by_label('查询服务（名称 / ID / URL）',exact=True)
+            for query,count in (('cli_synthetic',0),(secret,0),('飞书只读2',1),('fs',1)):
+                await search.fill(query);await expect(page.locator('.service-card')).to_have_count(count)
+            await search.fill('')
+            # Device grants: select-all only touches the Feishu group; saving and applying are explicit.
+            await page.goto('http://test.local/#/devices/one')
+            group=page.get_by_role('group',name='飞书只读2',exact=True);await group.wait_for()
+            self.assertEqual(await group.get_by_role('checkbox').evaluate_all('(items)=>items.map(e=>e.checked)'),[False,False])
+            await group.get_by_role('button',name='全选',exact=True).click()
+            self.assertTrue(await page.get_by_role('group',name='HTTP one',exact=True).get_by_role('checkbox').is_checked())
+            await page.get_by_role('button',name='保存',exact=True).click()
+            await page.wait_for_function("document.getElementById('message').textContent.includes('已保存')")
+            self.assertEqual(writes[-1][2]['bindings'],{'fs':['im_v1_chat_list','docx_v1_document_rawContent']})
+            self.assertFalse(any(w[1].endswith('/apply') for w in writes))
+            await page.get_by_role('button',name='应用该设备',exact=True).click()
+            await page.wait_for_function("document.getElementById('message').textContent.includes('已保存')")
+            self.assertEqual(writes[-1][:2],('POST','devices/one/apply'))
+            # Rotation names affected devices; after rediscovery grants stay unchecked and marked for review.
+            await page.goto('http://test.local/#/services/fs')
+            await page.get_by_label('App Secret',exact=True).fill('rotated-secret')
+            await page.get_by_role('button',name='保存',exact=True).click()
+            await page.wait_for_function("document.getElementById('message').textContent.includes('受影响设备: Device one')")
+            await expect(page.get_by_text('尚未发现工具，请先发现。',exact=True)).to_be_visible()
+            await page.get_by_role('button',name='发现工具（不执行工具）',exact=True).click()
+            await page.get_by_text('im_v1_chat_list',exact=True).wait_for()
+            count=len(writes)
+            await page.goto('http://test.local/#/devices/one')
+            group=page.get_by_role('group',name='飞书只读2',exact=True);await group.wait_for()
+            self.assertEqual(await group.get_by_role('checkbox').evaluate_all('(items)=>items.map(e=>e.checked)'),[False,False])
+            await expect(group.get_by_text('待复核',exact=False)).to_have_count(2)
+            self.assertEqual(len(writes),count)
+            # English, and the narrow layout has no root overflow.
+            await page.goto('http://test.local/#/services/new')
+            await page.get_by_role('tab',name='飞书只读',exact=True).wait_for()
+            await page.locator('#language').select_option('en')
+            await page.get_by_role('tab',name='Feishu read-only',exact=True).click()
+            await page.get_by_label('App Secret',exact=True).wait_for()
+            await expect(page.locator('#view p',has_text='App identity · read-only tools only · runs in the proxy container')).to_be_visible()
+            await page.set_viewport_size({'width':390,'height':844})
+            self.assertTrue(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'))
+            self.assertEqual(errors,[])
+
 if __name__=='__main__':unittest.main()
