@@ -12,3 +12,6 @@ __pycache__/
 *.pem
 *.key
 apikey.json
+# ignore docs/superpowers directory
+docs/superpowers/
+
