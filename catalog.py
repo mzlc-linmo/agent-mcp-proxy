@@ -8,6 +8,7 @@ from pathlib import Path
 from admin_config import ConfigError,ConfigStore
 from policy import ALLOWED
 from service_transport import validate_target,auth_headers
+import feishu_readonly
 
 
 def schema_hash(schema):
@@ -53,6 +54,9 @@ class CatalogStore:
     def public(self):
         v=self.load();services={}
         for sid,s in v['services'].items():
+            if feishu_readonly.is_feishu(s):
+                services[sid]={k:copy.deepcopy(s[k]) for k in ('id','name','provider','transport','app_id','discovery')}|{'app_secret_configured':bool(s['app_secret'])}
+                continue
             from urllib.parse import urlsplit
             u=urlsplit(s['url']);safe_url=s['url'] if not u.query else u.scheme+'://'+u.netloc+'/…'
             services[sid]={k:copy.deepcopy(s[k]) for k in ('id','name','transport','private_network','discovery')}
@@ -65,10 +69,24 @@ class CatalogStore:
             if type(version) is not int or version!=v['version']:raise ConfigError('Configuration version conflict',409)
             fn(v);v['version']+=1;self._validate(v);self.disk._write(v);return v['version']
     def add_service(self,entry,version):
+        if isinstance(entry,dict) and ('provider' in entry or entry.get('transport')=='stdio'):return self._add_feishu(entry,version)
         if set(entry)!={'name','url','transport','auth','private_network'}:raise ConfigError()
         sid=uuid.uuid4().hex[:12]
         saved=self._change(version,lambda v:v['services'].update({sid:copy.deepcopy(entry)|{'id':sid,'discovery':[],'legacy_profile':None}}))
         return {'id':sid,'saved_version':saved}
+    def _add_feishu(self,entry,version):
+        if set(entry)!={'name','provider','transport','app_id','app_secret'} or entry['provider']!=feishu_readonly.PROVIDER or entry['transport']!=feishu_readonly.TRANSPORT:raise ConfigError()
+        self._feishu_credentials(entry['app_id'],entry['app_secret'])
+        sid=uuid.uuid4().hex[:12]
+        saved=self._change(version,lambda v:v['services'].update({sid:copy.deepcopy(entry)|{'id':sid,'discovery':[],'legacy_profile':None}}))
+        return {'id':sid,'saved_version':saved}
+
+    @staticmethod
+    def _feishu_credentials(app_id,app_secret):
+        # Validation messages are fixed; credential values never reach errors.
+        try:feishu_readonly.validate_credentials(app_id,app_secret)
+        except ValueError:raise ConfigError('Invalid Feishu application credentials',422,'invalid_feishu_credentials') from None
+
     def import_services(self,entries,version):
         if not isinstance(entries,list) or not entries:raise ConfigError()
         ids=[]
@@ -83,7 +101,9 @@ class CatalogStore:
     def record_discovery(self,sid,tools,version):
         def change(v):
             service=self._service(v,sid);snapshot=[];names=set()
-            for tool in tools:
+            # The fixed read-only list filters snapshots before they can become grantable.
+            items=[t for t in tools if isinstance(t,dict) and t.get('name') in feishu_readonly.WIRE_TOOL_NAMES] if feishu_readonly.is_feishu(service) else tools
+            for tool in items:
                 if not isinstance(tool,dict) or not isinstance(tool.get('name'),str) or tool['name'] in names or not isinstance(tool.get('inputSchema'),dict):raise ConfigError('Invalid discovery result')
                 names.add(tool['name']);item={k:copy.deepcopy(tool[k]) for k in ('name','description','inputSchema','annotations') if k in tool}
                 item['schema_hash']=schema_hash(tool['inputSchema']);snapshot.append(item)
@@ -95,11 +115,30 @@ class CatalogStore:
         if sid not in v['services']:raise ConfigError('Service not found',404)
         return v['services'][sid]
 
+    def _update_feishu(self,v,s,patch):
+        if set(patch)-{'name','app_id','app_secret'}:raise ConfigError()
+        update=copy.deepcopy(patch)
+        if update.get('app_secret')=='':update.pop('app_secret')
+        app_id=update.get('app_id',s['app_id']);app_secret=update.get('app_secret',s['app_secret'])
+        self._feishu_credentials(app_id,app_secret)
+        rotated=app_id!=s['app_id'] or app_secret!=s['app_secret']
+        s.update(update)
+        if rotated:
+            # A new application must never inherit grants just because schemas match.
+            s['discovery']=[]
+            for device in v['devices']:
+                for grant in device['bindings'].get(s['id'],[]):grant['schema_hash']='review-required'
+
     def update_service(self,sid,patch,version):
-        if not isinstance(patch,dict) or set(patch)-{'name','url','transport','auth','private_network'}:raise ConfigError()
+        if not isinstance(patch,dict) or set(patch)-{'name','url','transport','auth','private_network','app_id','app_secret'}:raise ConfigError()
         affected=[]
         def change(v):
-            s=self._service(v,sid);before=copy.deepcopy(s)
+            s=self._service(v,sid)
+            if feishu_readonly.is_feishu(s):
+                self._update_feishu(v,s,patch)
+                affected.extend(d['id'] for d in v['devices'] if sid in d['bindings']);return
+            if set(patch)-{'name','url','transport','auth','private_network'}:raise ConfigError()
+            before=copy.deepcopy(s)
             update=copy.deepcopy(patch)
             if update.get('url')=='':update.pop('url')
             if 'auth' in update:
@@ -165,7 +204,7 @@ class CatalogStore:
                 bindings=update.pop('bindings');grants=copy.deepcopy(device['bindings'])
                 if not isinstance(bindings,dict):raise ConfigError()
                 for sid,names in bindings.items():
-                    service=self._service(v,sid);known={t['name']:t for t in service['discovery']}
+                    service=self._service(v,sid);known={t['name']:t for t in service['discovery'] if feishu_readonly.tool_allowed(service,t['name'])}
                     if not isinstance(names,list) or any(not isinstance(n,str) for n in names) or len(names)!=len(set(names)) or not set(names)<=set(known):raise ConfigError('Discover tools before granting access')
                     if not names:
                         grants.pop(sid,None)
@@ -191,7 +230,10 @@ class CatalogStore:
             if not isinstance(v['services'],dict) or len(v['services'])>20 or not 0<=len(v['devices'])<=10:raise ValueError()
             ids=set()
             for sid,s in v['services'].items():
-                if sid!=s['id'] or not isinstance(s['name'],str) or not 1<=len(s['name'])<=80 or s['transport'] not in ('streamable-http','sse') or type(s['private_network']) is not bool:raise ValueError()
+                if feishu_readonly.is_feishu(s):
+                    if sid!=s['id']:raise ValueError()
+                    feishu_readonly.validate_feishu_service(s);continue
+                if 'provider' in s or sid!=s['id'] or not isinstance(s['name'],str) or not 1<=len(s['name'])<=80 or s['transport'] not in ('streamable-http','sse') or type(s['private_network']) is not bool:raise ValueError()
                 validate_target(s['url'],s['private_network']);auth_headers(s['auth'])
                 if not isinstance(s['discovery'],list) or len(s['discovery'])>200:raise ValueError()
             urls=set()
