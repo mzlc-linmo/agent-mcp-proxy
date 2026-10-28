@@ -13,8 +13,9 @@ class ImportTests(unittest.TestCase):
         rows=parse_import({'mcpServers':{'one':{'url':'https://example.com/mcp','type':'streamable-http','headers':{'Authorization':'Bearer synthetic'}},'two':{'url':'https://example.com/sse','type':'sse'}}})
         self.assertEqual(rows[0]['auth'],{'mode':'bearer','value':'synthetic'})
         self.assertEqual(rows[1]['transport'],'sse')
-    def test_commands_extra_headers_and_unconfirmed_private_rejected(self):
-        for entry in [{'command':'npx','args':['bad']},{'url':'https://example.com','headers':{'Host':'evil'}},{'url':'http://10.0.0.1/mcp'}]:
+    def test_malformed_commands_extra_headers_and_unconfirmed_private_rejected(self):
+        # Plain stdio commands are importable since CMP-395; command+url, cwd and non-stdio command entries are not.
+        for entry in [{'command':'npx','url':'https://example.com/mcp'},{'command':'npx','cwd':'/tmp'},{'command':'npx','type':'sse'},{'command':'npx','args':'-y pkg'},{'url':'https://example.com','headers':{'Host':'evil'}},{'url':'http://10.0.0.1/mcp'}]:
             with self.subTest(entry=entry),self.assertRaises(ImportError):parse_import({'mcpServers':{'x':entry}})
     def test_private_confirmation_and_descriptor(self):
         rows=parse_import({'name':'Vendor','mcpServers':{'vendor':{'url':'http://10.0.0.1/mcp','allowInsecurePrivateNetwork':True}}})

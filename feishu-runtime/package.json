@@ -1,0 +1,10 @@
+{
+  "name": "agent-mcp-proxy-feishu-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned official Feishu MCP package for the read-only stdio bridge",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@larksuiteoapi/lark-mcp": "0.5.1"
+  }
+}

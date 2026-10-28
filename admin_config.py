@@ -10,10 +10,12 @@ from urllib.parse import parse_qs, urlsplit
 from policy import ALLOWED
 
 class ConfigError(ValueError):
-    def __init__(self, message='Invalid configuration', status=422, code=None):
+    def __init__(self, message='Invalid configuration', status=422, code=None, detail=None):
         super().__init__(message)
         self.status=status
         self.code=code
+        # Already-redacted context for the page (e.g. a local program's stderr tail); never credentials.
+        self.detail=detail
 
 class ConfigStore:
     def __init__(self, path: Path, allowed_origin: str):

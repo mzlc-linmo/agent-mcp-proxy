@@ -10,8 +10,39 @@ from mcp.shared.message import SessionMessage
 from catalog import schema_hash
 from admin_config import ConfigError
 from policy import compact
-from service_transport import service_session
+from service_transport import service_session,session_timeout
 from proxy import connect,secure_logging
+import feishu_readonly
+import local_stdio
+from feishu_stdio import error_code
+
+FEISHU_HINT='[飞书应用身份·只读] '
+FEISHU_ERRORS={'rejected':'Feishu read-only call rejected or failed (check app permission and resource visibility); no automatic replay',
+    'unsupported':'Feishu returned a non-text result; no automatic replay',
+    'too_large':'Feishu result exceeds 1024 bytes; narrow the query (smaller page_size or range); no automatic replay'}
+
+
+def _feishu_business_error(text):
+    """The official handler returns an HTTP 200 body unchanged when it has no data field, so a non-zero code there is a failure."""
+    try:value=json.loads(text)
+    except ValueError:return False
+    return isinstance(value,dict) and 'code' in value and value['code']!=0
+
+
+async def call_feishu(session,service,original,arguments):
+    def failure(kind):return types.CallToolResult(isError=True,content=[types.TextContent(type='text',text=FEISHU_ERRORS[kind])])
+    # Checked again immediately before forwarding; the hint in descriptions is not the guard.
+    if not feishu_readonly.tool_allowed(service,original):return failure('rejected')
+    try:
+        async with asyncio.timeout(20):result=await session.call_tool(original,arguments)
+    except Exception:return failure('rejected')
+    # Upstream error text can reflect request data, so it is never forwarded.
+    if result.isError:return failure('rejected')
+    if not result.content or any(not isinstance(c,types.TextContent) for c in result.content):return failure('unsupported')
+    text='\n'.join(c.text for c in result.content)
+    if _feishu_business_error(text):return failure('rejected')
+    if len(text.encode())>1024:return failure('too_large')
+    return types.CallToolResult(isError=False,content=[types.TextContent(type='text',text=text)])
 
 
 def device_snapshot(config,eid):
@@ -26,6 +57,8 @@ def approved_tools(service,grants,tools):
     actual={t['name']:t for t in tools}
     result=[]
     for grant in grants:
+        # The fixed Feishu list is enforced here as well, so forged snapshots or grants never publish.
+        if not feishu_readonly.tool_allowed(service,grant['name']):continue
         tool=actual.get(grant['name'])
         if tool is None:continue
         current=schema_hash(tool['inputSchema'])
@@ -44,12 +77,15 @@ async def bridge_catalog(config,report):
     async with AsyncExitStack() as stack:
         for sid,service in config['services'].items():
             grants=config['bindings'].get(sid,[])
+            if feishu_readonly.is_feishu(service) or local_stdio.is_local(service):
+                # Grants awaiting review (or outside the fixed Feishu list) never start a process.
+                grants=[g for g in grants if feishu_readonly.tool_allowed(service,g['name']) and g['schema_hash']!='review-required']
             if not grants:
                 report('upstream',{'domain':sid,'state':'disabled'});continue
             # Each service gets its own child stack so failed initialization closes partial resources.
             child=await stack.enter_async_context(AsyncExitStack())
             try:
-                async with asyncio.timeout(15):
+                async with asyncio.timeout(session_timeout(service,15)):
                     session=await child.enter_async_context(service_session(service))
                     tools=[];cursor=None
                     for _ in range(20):
@@ -59,15 +95,18 @@ async def bridge_catalog(config,report):
                         cursor=page.nextCursor
                         if not cursor:break
                     else:raise ValueError('Too many pages')
-            except Exception:
+            except Exception as error:
                 await child.aclose()
-                report('upstream',{'domain':sid,'state':'unavailable'});continue
+                code=error_code(error)
+                report('upstream',{'domain':sid,'state':'unavailable'}|({'error_code':code} if code else {}));continue
             approved=approved_tools(service,grants,tools)
             report('upstream',{'domain':sid,'state':'discovered','discovered':len(tools),'published':len(approved)})
             for alias,tool in approved:
                 if alias in routes:raise ValueError('Duplicate publication alias')
-                routes[alias]=(session,tool['name'],service.get('legacy_profile'))
-                published.append(types.Tool(name=alias,description=tool.get('description',tool['name']),inputSchema=tool['inputSchema'],annotations=types.ToolAnnotations(**tool['annotations']) if tool.get('annotations') else None))
+                routes[alias]=(session,tool['name'],service.get('legacy_profile'),service)
+                description=tool.get('description',tool['name'])
+                if feishu_readonly.is_feishu(service):description=FEISHU_HINT+description
+                published.append(types.Tool(name=alias,description=description,inputSchema=tool['inputSchema'],annotations=types.ToolAnnotations(**tool['annotations']) if tool.get('annotations') else None))
 
         @server.list_tools()
         async def list_tools():return published
@@ -75,7 +114,8 @@ async def bridge_catalog(config,report):
         @server.call_tool()
         async def call_tool(name,arguments):
             if name not in routes:return types.CallToolResult(isError=True,content=[types.TextContent(type='text',text='Tool not authorized')])
-            session,original,profile=routes[name]
+            session,original,profile,service=routes[name]
+            if feishu_readonly.is_feishu(service):return await call_feishu(session,service,original,arguments)
             try:
                 async with asyncio.timeout(20):result=await session.call_tool(original,arguments)
                 if result.isError:raise ValueError('Upstream rejected')

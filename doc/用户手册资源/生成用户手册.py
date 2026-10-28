@@ -86,7 +86,7 @@ def main():
     header.text = 'Agent MCP Proxy  |  软件用户使用手册'
     footer = section.footer.paragraphs[0]
     footer.alignment = 2
-    footer.add_run('用户手册 1.0  ·  第 ')
+    footer.add_run('用户手册 1.2  ·  第 ')
     field = OxmlElement('w:fldSimple'); field.set(qn('w:instr'), 'PAGE'); footer._p.append(field)
     footer.add_run(' 页')
     document.core_properties.title = 'Agent MCP Proxy 软件用户使用手册'
@@ -99,7 +99,7 @@ def main():
     cover.add_run('Agent MCP Proxy')
     document.add_paragraph('软件用户使用手册', style='Subtitle')
     document.add_paragraph('登录 · 接入服务 · 授权设备 · 日常维护')
-    document.add_paragraph('文档版本 1.0\n编制日期 2026 年 10 月 24 日\n适用当前设备与 MCP 服务目录管理版')
+    document.add_paragraph('文档版本 1.2\n编制日期 2026 年 10 月 27 日\n适用当前设备与 MCP 服务目录管理版')
     note = document.add_paragraph('所有界面插图均使用模拟数据，不包含真实凭据；模拟连接状态不代表实际设备验收结果。')
     note.paragraph_format.space_before = Cm(2)
     document.add_page_break()
@@ -189,7 +189,7 @@ def main():
         i += 1
     document.save(OUTPUT)
     result = Document(OUTPUT)
-    assert len(result.inline_shapes) == 5
+    assert len(result.inline_shapes) == 7
     assert len(result.tables) >= 12
     assert sum(p.style.name == 'Heading 1' for p in result.paragraphs) == 18
     print('Created:', OUTPUT)
